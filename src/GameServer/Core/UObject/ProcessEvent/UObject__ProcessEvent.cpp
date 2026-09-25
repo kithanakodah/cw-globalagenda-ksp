@@ -1,0 +1,2566 @@
+#include "src/GameServer/Combat/MissionClearance/MissionClearance.hpp"
+#include "src/GameServer/Core/UObject/ProcessEvent/UObject__ProcessEvent.hpp"
+#include "src/GameServer/TgGame/TgDeviceFire/GetEffectGroup/TgDeviceFire__GetEffectGroup.hpp"
+#include "src/GameServer/TgGame/TgEffectManager/RemoveEffectGroupsByCategory/TgEffectManager__RemoveEffectGroupsByCategory.hpp"
+#include "src/GameServer/TgGame/TgGame/BeginEndMission/TgGame__BeginEndMission.hpp"
+#include "src/GameServer/TgGame/TgGame/ActivateAlarm/TgGame__ActivateAlarm.hpp"
+#include "src/GameServer/TgGame/TgGame/UpdateMissionTimerEventWinVar/TgGame__UpdateMissionTimerEventWinVar.hpp"
+#include "src/GameServer/TgGame/TgInventoryManager/NonPersistRemoveDevice/TgInventoryManager__NonPersistRemoveDevice.hpp"
+#include "src/GameServer/TgGame/TgTeamBeaconManager/BeaconSdkSafe/BeaconSdkSafe.hpp"
+#include "src/GameServer/Armor/Armor.hpp"
+#include "src/GameServer/Inventory/Inventory.hpp"
+#include "src/GameServer/Stats/MatchStats.hpp"
+#include "src/GameServer/Combat/MissionAlerts/SendAlert.hpp"
+#include "src/GameServer/Utils/ObjectClassCache/ObjectClassCache.hpp"
+#include "src/GameServer/TgGame/_deployable_classify/DeployableClassify.hpp"
+#include "src/GameServer/Storage/ClientConnectionsData/ClientConnectionsData.hpp"
+#include "src/GameServer/Storage/ActiveSpectatorCount/ActiveSpectatorCount.hpp"
+#include "src/GameServer/Storage/TeamsData/TeamsData.hpp"
+#include "src/GameServer/GameModes/SuperAgent/SuperAgent.hpp"
+#include "src/Config/Config.hpp"
+#include "src/GameServer/Globals.hpp"
+#include "src/Utils/Logger/Logger.hpp"
+#include <string>
+#include <unordered_map>
+#include <cstdlib>  // wcstombs (kismet LinkDesc → char buffer)
+
+// TgPawn__SetProperty @ 0x109bf420 — __thiscall(pawn, nPropertyId, fNewValue)
+// Called as __fastcall with dummy EDX to avoid inline asm.
+static void SetPawnProperty(ATgPawn* Pawn, int nPropertyId, float fNewValue) {
+	((void(__fastcall*)(ATgPawn*, void*, int, float))0x109bf420)(Pawn, nullptr, nPropertyId, fNewValue);
+}
+
+// True if any of this device's fire modes carries a Stealth-category (621)
+// effect group. Used by the per-refire HUD timer refresh and the
+// ServerStopFire immediate-teardown path.
+//
+// Forces lazy population of s_EffectGroupList if empty — first activation
+// has the list empty until UC's fire path triggers GetEffectGroup. Calling
+// our hook with sentinel nType=-1 fills it as a side effect.
+//
+// Memoized per-ATgDevice* via `s_stealthDeviceCache`. RefireCheckTimer fires
+// while the trigger is held (every 50-100 ms), and before memoization this
+// walked m_FireMode + s_EffectGroupList on every tick. The fire-mode roster
+// and per-mode effect-group list are immutable for a device's lifetime, so
+// after the first call the answer is stable. Cache holds only `true` entries
+// to keep the lazy-population branch live on first call (entries fall through
+// to the full walk until s_EffectGroupList has been populated and a 621
+// category is detected). False results aren't cached — they're cheap to
+// recompute and a future fire mode add (we don't currently do this, but
+// defensive) would still take effect.
+static std::unordered_map<ATgDevice*, bool> s_stealthDeviceCache;
+
+static bool HasStealthEffectGroup(ATgDevice* Device) {
+	if (!Device) return false;
+	auto it = s_stealthDeviceCache.find(Device);
+	if (it != s_stealthDeviceCache.end()) return it->second;
+
+	for (int m = 0; m < Device->m_FireMode.Count; m++) {
+		UTgDeviceFire* fireMode = Device->m_FireMode.Data[m];
+		if (!fireMode) continue;
+		if (fireMode->s_EffectGroupList.Count == 0) {
+			int idx = 0;
+			TgDeviceFire__GetEffectGroup::Call(fireMode, nullptr, -1, &idx);
+		}
+		for (int i = 0; i < fireMode->s_EffectGroupList.Count; i++) {
+			UTgEffectGroup* eg = fireMode->s_EffectGroupList.Data[i];
+			if (eg && eg->m_nCategoryCode == 621) {
+				s_stealthDeviceCache[Device] = true;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Native TgEffectManager::RefreshEffectRep @ 0x10a6efd0
+// __thiscall(this, slot, fInitTimeRemaining). Writes the replicated HUD slot
+// (r_ManagedEffectList[slot].fInitTimeRemaining), bumps the upper-16-bit
+// generation counter in nExtraInfo so the client sees the refresh even if
+// the float value hasn't changed, and sets bNetDirty.
+typedef void (__fastcall *RefreshEffectRepFn)(ATgEffectManager*, void*, unsigned int, float);
+static const RefreshEffectRepFn RefreshEffectRepNative =
+	(RefreshEffectRepFn)0x10a6efd0;
+
+// Refresh every active Stealth-category effect group on `Pawn` back to its
+// full lifetime. Called from a continuous-fire signal so the short-lived
+// (1s) managed effect keeps getting a fresh timer while the fire button is
+// held. When the button releases, the refresh stops and the existing timer
+// expires in ≤1s (the ServerStopFire hook tears it down immediately anyway).
+//
+// Refresh = zero the timer entry's Count (elapsed-time accumulator) so it
+// re-arms for another full Rate. Uses SDK's FTimerData struct members
+// directly rather than raw offsets.
+static void RefreshStealthEffectTimers(ATgPawn* Pawn) {
+	if (!Pawn) return;
+	ATgEffectManager* Mgr = Pawn->r_EffectManager;
+	if (!Mgr) return;
+
+	for (int i = 0; i < Mgr->s_AppliedEffectGroups.Count; i++) {
+		UTgEffectGroup* g = Mgr->s_AppliedEffectGroups.Data[i];
+		if (!g || g->m_nCategoryCode != 621) continue;
+
+		// Reset the LifeDone timer's elapsed accumulator (FTimerData::Count)
+		// for this group.
+		for (int t = 0; t < Mgr->Timers.Count; t++) {
+			FTimerData& timer = Mgr->Timers.Data[t];
+			if (timer.TimerObj == (UObject*)g) {
+				timer.Count = 0.0f;
+			}
+		}
+
+		// Push the refreshed countdown to the client HUD slot.
+		int slot = g->s_ManagedEffectListIndex;
+		if (slot >= 0 && slot < 0x10) {
+			Mgr->m_fTimeRemaining[slot] = g->m_fLifeTime;
+			RefreshEffectRepNative(Mgr, nullptr, (unsigned int)slot, g->m_fLifeTime);
+		}
+	}
+}
+
+// Carrier-loss cleanup (beacon-carrying pawn dies / its PlayerController is
+// destroyed on disconnect) moved to BeaconSdk::DropCarriedBeacon so the
+// team-change teleport path can share it — see BeaconSdkSafe.{hpp,cpp}.
+
+// (Former NativeApplyEffect / NativeRemoveEffect / ComputeEffectDelta helpers
+// were removed — see the commented-out TgEffect.ApplyEffect/Remove branches
+// in Call() below for the reasoning. UC owns the apply/remove math now; we
+// just promote stealth-category groups to managed lifetime, refresh their
+// timers on continuous fire, and tear down explicitly on fire-release.)
+//
+// Buff-routing for class-157 effects splits across two hook sites:
+//  - Apply: `TgEffectManager__SetEffectRep::Call` (post-original) — the
+//    apply chain doesn't surface in our ProcessEvent hook for reasons
+//    documented in `ApplyBuffEffect.hpp`, but SetEffectRep does fire
+//    reliably and arrives with `s_AppliedEffectGroups` populated.
+//  - Remove: the `Function TgGame.TgEffect.Remove` branch below — our
+//    reimplemented `TgEffectGroup__RemoveEffects` explicitly dispatches
+//    `eventRemove` via ProcessEvent for each effect, so this branch fires
+//    symmetrically with the SetEffectRep apply.
+
+// One of these tags is computed for each UFunction the first time we see it
+// and cached forever after. UFunction* is stable for the process lifetime,
+// so a pointer-keyed cache lets us replace the historical strcmp cascade
+// over Function->GetFullName() with an O(1) hash probe.
+enum class DispatchTag : uint8_t {
+	Unknown = 0,                  // catch-all (log + CallOriginal)
+	EarlyOut,                     // pass-through: just CallOriginal
+	ServerMove,                   // Ping diagnostic: sampled move timestamp, otherwise pass-through
+	OldServerMove,                // Ping diagnostic: sampled old move timestamp, otherwise pass-through
+	DualServerMove,               // Ping diagnostic: sampled dual move timestamp, otherwise pass-through
+	TgShortServerMove,            // Ping diagnostic: GA compact move wrapper, otherwise pass-through
+	TgRMServerMove,               // Ping diagnostic: GA reliable move wrapper, otherwise pass-through
+	ServerUpdatePing,             // Ping diagnostic: client-reported ping, otherwise pass-through
+	ClientAckGoodMove,            // Ping diagnostic: sampled server ACK timestamp, otherwise pass-through
+	ClientAdjustPosition,         // Ping diagnostic: sampled server movement correction, otherwise pass-through
+	ShortClientAdjustPosition,    // Ping diagnostic: sampled server movement correction, otherwise pass-through
+	VeryShortClientAdjustPosition,// Ping diagnostic: sampled server movement correction, otherwise pass-through
+	LongClientAdjustPosition,     // Ping diagnostic: sampled server movement correction, otherwise pass-through
+	SendClientAdjustment,         // Ping diagnostic: server ACK/correction source for client UpdatePing
+	RefireCheckTimer,             // independent stealth-refresh side effect, then catch-all
+	TgGameLogin,                  // CallOriginal then clear PRI spectator flags
+	TgGamePostLogin,              // Pre-seed PRI.r_TaskForce, then CallOriginal
+	SpectateVisualState,          // Diagnostic for black-screen/fade/view-target join races
+	DyingBeginState,              // CallOriginal then BotDied
+	DeviceFiringEndState,         // CallOriginal then jetpack-flag clear
+	DeviceFiringBeginState,       // Rest device: set r_nRestDeviceSlot while resting (transient)
+	ServerStopFire,               // CallOriginal then RemoveEffectGroupsByCategory(stealth)
+	TgEffectRemove,               // DoCatchAll — TgEffectBuff.Remove now reverses buffs canonically
+	PostPawnSetup,                // CallOriginal (sets PHYS_Falling) then restore PHYS_Flying for flying bots
+	ServerStartFire,              // Diagnostic: log every CanDeviceFireNow gate before CallOriginal
+	GetPlayerViewPoint,           // Pre-sync c_nCameraYawOffset / c_nCameraPitchOffset from ctrl.Rotation
+	BeaconPickUpDeployable,       // Diagnostic: log gate values before CallOriginal + return after
+	PawnPickupNearestDeployable,  // Diagnostic: log TouchingActors walk + which deployable was picked
+	BeaconEntranceHasExit,        // Post-call: override return to false when r_Beacon->m_bIsDeployed=0
+	PlayerControllerDestroyed,    // Pre-call: drop carried beacon if any, then CheckBeacon respawn
+	PawnDestroyed,                // Post-call: drop this pawn's pawnId-keyed Armor + Inventory tracking entries
+	ServerPickupPutdownDeployableTag, // Diagnostic: log RPC entry to confirm key press reaches server
+	SeqOpActivated,               // kismet op eventActivated — TgSeqAct_AlarmBots raises the global alarm
+	TgTriggerBeaconEntrance,      // Pre-call: record teammate beacon-teleport usage for match stats
+	SuperAgentCaptureGate,        // Super Agent mode: freeze proximity capture per the all-players / drain gate, then detect A's capture
+	SuperAgentMarchDrive,         // Super Agent mode: rewrite AI movement params so tracked outside marchers run at A
+	PayloadDeployableCrush,       // Payload (TgObjectiveAttachActor) Touch/RanInto/EncroachingOn — skip for morale Dome Shields
+	SensorProximitySweep,         // Post-call: remove TouchedPlayers beyond config radius (UC loop can't see pawns outside m_fProximityDistance)
+	DevCheatRpc,                  // Client-invocable dev/cheat server RPCs (Icarus/Zeus/TgSvrExec/...) — dropped unless PRI bAdmin
+	DeployableTakeDamage,         // Diagnostic (indestructible beacons): log entry gates + result of UC TakeDamage on exit beacons
+	BeaconDestroyIt,              // Diagnostic (indestructible beacons): log DestroyIt entry gates on exit beacons
+        MissionStart,                 // MissionTimerStart -- broadcast mission info to instance chat
+	BossBarrierTouch,             // Gated one-way orange boss room entrance
+        BeaconHealthWatch,            // Diagnostic (indestructible beacons): per-tick change watcher over beacon health/PCT fields
+	// GameTimerDiagnostic,          // Diagnostic-only: before/after snapshots around original timer/match flow
+};
+
+static bool IsGameTimerDiagnosticFunction(const char* name) {
+	if (!name) return false;
+
+	if (strcmp(name, "Function TgGame.TgGame.StartGameTimer") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame_Arena.StartGameTimer") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.MissionTimer") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame_Arena.MissionTimer") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.ChangeTimerState") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.SetMissionTime") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.MissionTimerStart") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.MissionTimerStop") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.SendMissionTimerEvent") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame.SendMissionTimerNotify") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame_Arena.GameStarted") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame_Arena.PreRoundFinished") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame_Arena.NextRoundStart") == 0 ||
+	    strcmp(name, "Function TgGame.TgGame_Defense.RoundTimer") == 0) {
+		return true;
+	}
+
+	if (strstr(name, ".PreRound.BeginState") ||
+	    strstr(name, ".RoundInProgress.BeginState") ||
+	    strstr(name, ".PostRound.BeginState") ||
+	    strstr(name, ".GameRunning.BeginState")) {
+		return true;
+	}
+
+	return false;
+}
+
+struct PingPawnContext {
+	int characterId = -1;
+	int itemProfileId = -1;
+	int profileId = -1;
+	int profileType = -1;
+	int skillGroupSetId = -1;
+	int deviceActors = -1;
+	int replicatedDevices = -1;
+};
+
+static PingPawnContext GetPingPawnContext(APawn* pawn) {
+	PingPawnContext ctx;
+	if (!pawn) return ctx;
+
+	std::string pawnClass = pawn->Class ? pawn->Class->GetFullName() : "";
+	if (pawnClass.find("TgPawn") == std::string::npos) return ctx;
+
+	ATgPawn* tgPawn = (ATgPawn*)pawn;
+	ctx.profileId = tgPawn->r_nProfileId;
+	ctx.profileType = tgPawn->r_nProfileTypeValueId;
+	ctx.deviceActors = 0;
+	ctx.replicatedDevices = 0;
+	for (int i = 0; i < 0x19; i++) {
+		if (tgPawn->m_EquippedDevices[i]) ctx.deviceActors++;
+		if (tgPawn->r_EquipDeviceInfo[i].nDeviceId != 0 ||
+		    tgPawn->r_EquipDeviceInfo[i].nDeviceInstanceId != 0) {
+			ctx.replicatedDevices++;
+		}
+	}
+
+	if (pawnClass.find("TgPawn_Character") != std::string::npos) {
+		ATgPawn_Character* characterPawn = (ATgPawn_Character*)pawn;
+		ctx.characterId = characterPawn->s_nCharacterId;
+		ctx.itemProfileId = characterPawn->r_nItemProfileId;
+		ctx.skillGroupSetId = characterPawn->r_nSkillGroupSetId;
+	}
+	return ctx;
+}
+
+static void LogMovePingSample(
+	const char* rpcName,
+	APlayerController* pc,
+	float timestamp,
+	unsigned char flags,
+	const FVector* clientLoc = nullptr) {
+	if (!Logger::IsChannelEnabled("ping") || !pc) return;
+
+	struct MovePingSampleState {
+		std::unordered_map<std::string, float> lastTimestampByRpc;
+	};
+	static std::unordered_map<APlayerController*, MovePingSampleState> s_movePingSamples;
+
+	MovePingSampleState& state = s_movePingSamples[pc];
+	const std::string rpcKey = rpcName ? rpcName : "";
+	auto inserted = state.lastTimestampByRpc.emplace(rpcKey, -1000.0f);
+	float& lastTimestamp = inserted.first->second;
+	if ((timestamp - lastTimestamp) < 1.0f) return;
+	lastTimestamp = timestamp;
+
+	APlayerReplicationInfo* pri = pc->PlayerReplicationInfo;
+	APawn* pawn = pc->Pawn;
+	const char* pcState = pc->GetStateName().GetName();
+	const char* pawnState = pawn ? pawn->GetStateName().GetName() : nullptr;
+	const float exactPing = pri ? pri->ExactPing : -1.0f;
+	const int ping = pri ? pri->Ping : -1;
+	PingPawnContext ctx = GetPingPawnContext(pawn);
+
+	if (clientLoc) {
+		Logger::Log("ping",
+			"[%s] pc=%p ts=%.3f flags=0x%02x priPing=%d exact=%.4f pcState=%s pawn=%p pawnState=%s phys=%d char=%d itemProf=%d profile=%d profileType=%d skillGroup=%d devActors=%d repDevices=%d loc=(%.1f, %.1f, %.1f)\n",
+			rpcName, pc, timestamp, (unsigned int)flags, ping, exactPing,
+			pcState ? pcState : "<null>",
+			pawn, pawnState ? pawnState : "<null>", pawn ? (int)pawn->Physics : -1,
+			ctx.characterId, ctx.itemProfileId, ctx.profileId, ctx.profileType, ctx.skillGroupSetId, ctx.deviceActors, ctx.replicatedDevices,
+			clientLoc->X, clientLoc->Y, clientLoc->Z);
+	} else {
+		Logger::Log("ping",
+			"[%s] pc=%p ts=%.3f flags=0x%02x priPing=%d exact=%.4f pcState=%s pawn=%p pawnState=%s phys=%d char=%d itemProf=%d profile=%d profileType=%d skillGroup=%d devActors=%d repDevices=%d\n",
+			rpcName, pc, timestamp, (unsigned int)flags, ping, exactPing,
+			pcState ? pcState : "<null>",
+			pawn, pawnState ? pawnState : "<null>", pawn ? (int)pawn->Physics : -1,
+			ctx.characterId, ctx.itemProfileId, ctx.profileId, ctx.profileType, ctx.skillGroupSetId, ctx.deviceActors, ctx.replicatedDevices);
+	}
+}
+
+static void LogServerUpdatePing(APlayerController* pc, int newPing, const char* phase) {
+	if (!Logger::IsChannelEnabled("ping") || !pc) return;
+	APlayerReplicationInfo* pri = pc->PlayerReplicationInfo;
+	PingPawnContext ctx = GetPingPawnContext(pc->Pawn);
+	Logger::Log("ping",
+		"[ServerUpdatePing:%s] pc=%p new=%d priPing=%d exact=%.4f state=%s pawn=%p pawnState=%s phys=%d char=%d itemProf=%d profile=%d profileType=%d skillGroup=%d devActors=%d repDevices=%d\n",
+		phase, pc, newPing,
+		pri ? (int)pri->Ping : -1,
+		pri ? pri->ExactPing : -1.0f,
+		pc->GetStateName().GetName() ? pc->GetStateName().GetName() : "<null>",
+		pc->Pawn,
+		pc->Pawn && pc->Pawn->GetStateName().GetName() ? pc->Pawn->GetStateName().GetName() : "<null>",
+		pc->Pawn ? (int)pc->Pawn->Physics : -1,
+		ctx.characterId, ctx.itemProfileId, ctx.profileId, ctx.profileType, ctx.skillGroupSetId, ctx.deviceActors, ctx.replicatedDevices);
+}
+
+static void LogClientMoveAckSample(
+	const char* rpcName,
+	APlayerController* pc,
+	int bucket,
+	float timestamp,
+	int newPhysics,
+	const FVector* newLoc = nullptr) {
+	if (!Logger::IsChannelEnabled("ping") || !pc) return;
+
+	struct ClientMoveAckSampleState {
+		float lastTimestamp[5] = { -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f };
+	};
+	static std::unordered_map<APlayerController*, ClientMoveAckSampleState> s_clientMoveAckSamples;
+
+	if (bucket < 0 || bucket >= 5) return;
+	ClientMoveAckSampleState& state = s_clientMoveAckSamples[pc];
+	if ((timestamp - state.lastTimestamp[bucket]) < 1.0f) return;
+	state.lastTimestamp[bucket] = timestamp;
+
+	APlayerReplicationInfo* pri = pc->PlayerReplicationInfo;
+	APawn* pawn = pc->Pawn;
+	const char* pcState = pc->GetStateName().GetName();
+	const char* pawnState = pawn ? pawn->GetStateName().GetName() : nullptr;
+	const float exactPing = pri ? pri->ExactPing : -1.0f;
+	const int ping = pri ? pri->Ping : -1;
+	PingPawnContext ctx = GetPingPawnContext(pawn);
+
+	if (newLoc) {
+		Logger::Log("ping",
+			"[%s] pc=%p ackTs=%.3f newPhys=%d priPing=%d exact=%.4f pcState=%s pawn=%p pawnState=%s phys=%d char=%d itemProf=%d profile=%d profileType=%d skillGroup=%d devActors=%d repDevices=%d loc=(%.1f, %.1f, %.1f)\n",
+			rpcName, pc, timestamp, newPhysics, ping, exactPing,
+			pcState ? pcState : "<null>",
+			pawn, pawnState ? pawnState : "<null>", pawn ? (int)pawn->Physics : -1,
+			ctx.characterId, ctx.itemProfileId, ctx.profileId, ctx.profileType, ctx.skillGroupSetId, ctx.deviceActors, ctx.replicatedDevices,
+			newLoc->X, newLoc->Y, newLoc->Z);
+	} else {
+		Logger::Log("ping",
+			"[%s] pc=%p ackTs=%.3f newPhys=%d priPing=%d exact=%.4f pcState=%s pawn=%p pawnState=%s phys=%d char=%d itemProf=%d profile=%d profileType=%d skillGroup=%d devActors=%d repDevices=%d\n",
+			rpcName, pc, timestamp, newPhysics, ping, exactPing,
+			pcState ? pcState : "<null>",
+			pawn, pawnState ? pawnState : "<null>", pawn ? (int)pawn->Physics : -1,
+			ctx.characterId, ctx.itemProfileId, ctx.profileId, ctx.profileType, ctx.skillGroupSetId, ctx.deviceActors, ctx.replicatedDevices);
+	}
+}
+
+static void LogSendClientAdjustmentSample(const char* phase, APlayerController* pc) {
+	if (!Logger::IsChannelEnabled("ping") || !pc) return;
+
+	FClientAdjustment& adj = pc->PendingAdjustment;
+	APlayerReplicationInfo* pri = pc->PlayerReplicationInfo;
+	APawn* pawn = pc->Pawn;
+	PingPawnContext ctx = GetPingPawnContext(pawn);
+
+	Logger::Log("ping",
+		"[SendClientAdjustment:%s] pc=%p adjTs=%.3f ack=%d adjPhys=%d priPing=%d exact=%.4f currentTs=%.3f lastUpdate=%.3f pcState=%s pawn=%p pawnState=%s phys=%d char=%d itemProf=%d profile=%d profileType=%d skillGroup=%d devActors=%d repDevices=%d adjLoc=(%.1f, %.1f, %.1f) adjVel=(%.1f, %.1f, %.1f)\n",
+		phase,
+		pc,
+		adj.TimeStamp,
+		(int)adj.bAckGoodMove,
+		(int)adj.newPhysics,
+		pri ? (int)pri->Ping : -1,
+		pri ? pri->ExactPing : -1.0f,
+		pc->CurrentTimeStamp,
+		pc->LastUpdateTime,
+		pc->GetStateName().GetName() ? pc->GetStateName().GetName() : "<null>",
+		pawn,
+		pawn && pawn->GetStateName().GetName() ? pawn->GetStateName().GetName() : "<null>",
+		pawn ? (int)pawn->Physics : -1,
+		ctx.characterId, ctx.itemProfileId, ctx.profileId, ctx.profileType, ctx.skillGroupSetId, ctx.deviceActors, ctx.replicatedDevices,
+		adj.NewLoc.X, adj.NewLoc.Y, adj.NewLoc.Z,
+		adj.NewVel.X, adj.NewVel.Y, adj.NewVel.Z);
+}
+
+static void LogGameTimerSnapshot(const char* phase, UObject* Object, UFunction* Function) {
+	if (!Logger::IsChannelEnabled("gametimer")) return;
+
+	std::string functionName = Function ? Function->GetFullName() : "<null-function>";
+	std::string objectName = Object ? Object->GetFullName() : "<null-object>";
+	std::string objectClass = (Object && Object->Class) ? Object->Class->GetFullName() : "<null-class>";
+
+	ATgGame* Game = nullptr;
+	if (Object && objectClass.find("TgGame") != std::string::npos) {
+		Game = (ATgGame*)Object;
+	} else if (Globals::Get().GGameInfo) {
+		Game = (ATgGame*)Globals::Get().GGameInfo;
+	}
+
+	if (!Game) {
+		Logger::Log("gametimer",
+			"[%s] %s obj=%s class=%s game=<null>\n",
+			phase, functionName.c_str(), objectName.c_str(), objectClass.c_str());
+		return;
+	}
+
+	std::string gameName = ((UObject*)Game)->GetFullName();
+	std::string gameClass = Game->Class ? Game->Class->GetFullName() : "<null-game-class>";
+	std::string stateName = Game->GetStateName().GetName();
+
+	ATgRepInfo_Game* GRI = Game->GameReplicationInfo
+		? (ATgRepInfo_Game*)Game->GameReplicationInfo
+		: nullptr;
+
+	Logger::Log("gametimer",
+		"[%s] %s obj=%s objClass=%s game=%s gameClass=%s state=%s "
+		"wait=%d delayed=%d ended=%d timerState=%d pausedState=%d shouldWait=%d allowOT=%d winState=%d gameType=%d "
+		"mission=%.2f gameMission=%.2f overtime=%.2f startedAt=%.2f worldTime=%.2f "
+		"GRI{ptr=%p matchOver=%d round=%d/%d mtState=%d mtChange=%d rem=%.2f cTime=%.2f cSecs=%.2f remaining=%d limit=%d flags raid=%d mission=%d arena=%d match=%d overtime=%d}\n",
+		phase,
+		functionName.c_str(),
+		objectName.c_str(),
+		objectClass.c_str(),
+		gameName.c_str(),
+		gameClass.c_str(),
+		stateName.c_str(),
+		(int)Game->bWaitingToStartMatch,
+		(int)Game->bDelayedStart,
+		(int)Game->bGameEnded,
+		(int)Game->m_eTimerState,
+		(int)Game->m_eTimerStatePaused,
+		(int)Game->m_bShouldWait,
+		(int)Game->m_bAllowOvertime,
+		(int)Game->m_GameWinState,
+		(int)Game->m_GameType,
+		Game->m_fMissionTime,
+		Game->m_fGameMissionTime,
+		Game->m_fGameOvertimeTime,
+		Game->s_fMissionTimerStartedAt,
+		Game->WorldInfo ? Game->WorldInfo->TimeSeconds : -1.0f,
+		GRI,
+		GRI ? (int)GRI->bMatchIsOver : -1,
+		GRI ? GRI->r_nRoundNumber : -1,
+		GRI ? GRI->r_nMaxRoundNumber : -1,
+		GRI ? (int)GRI->r_nMissionTimerState : -1,
+		GRI ? GRI->r_nMissionTimerStateChange : -1,
+		GRI ? GRI->r_fMissionRemainingTime : -1.0f,
+		GRI ? GRI->c_fMissionTime : -1.0f,
+		GRI ? GRI->c_fMissionTimeSeconds : -1.0f,
+		GRI ? GRI->RemainingTime : -1,
+		GRI ? GRI->TimeLimit : -1,
+		GRI ? (int)GRI->r_bIsRaid : -1,
+		GRI ? (int)GRI->r_bIsMission : -1,
+		GRI ? (int)GRI->r_bIsArena : -1,
+		GRI ? (int)GRI->r_bIsMatch : -1,
+		GRI ? (int)GRI->r_bInOverTime : -1);
+
+	if (gameClass.find("TgGame_Arena") != std::string::npos ||
+	    gameClass.find("TgGame_Defense") != std::string::npos ||
+	    gameClass.find("TgGame_CTF") != std::string::npos ||
+	    gameClass.find("TgGame_PointRotation") != std::string::npos) {
+		ATgGame_Arena* Arena = (ATgGame_Arena*)Game;
+		Logger::Log("gametimer",
+			"[%s]   ArenaFields round=%d betweenDelay=%d setup=%d objectiveUnlock=%d resetPlayfield=%d resetPlayers=%d displayEnd=%d\n",
+			phase,
+			Arena->s_nRoundNumber,
+			Arena->s_nBetweenRoundDelay,
+			Arena->s_nRoundSetupTime,
+			Arena->s_nObjectiveUnlockDelay,
+			(int)Arena->s_bResetPlayfieldBetweenRounds,
+			(int)Arena->s_bResetPlayersBetweenRounds,
+			(int)Arena->s_bDisplayEndRoundScreen);
+	}
+
+	if (gameClass.find("TgGame_Defense") != std::string::npos) {
+		ATgGame_Defense* Defense = (ATgGame_Defense*)Game;
+		Logger::Log("gametimer",
+			"[%s]   DefenseFields maxRound=%d roundDuration=%.2f waveSpawners=%d\n",
+			phase,
+			Defense->s_nMaxRoundNumber,
+			Defense->s_fRoundDuration,
+			Defense->s_WaveSpawnerList.Count);
+	}
+}
+
+// Exit beacons only — "TgDeploy_Beacon" also prefixes TgDeploy_BeaconEntrance,
+// which is a static pad with no health lifecycle and would only add noise.
+static bool IsExitBeacon(UObject* Obj) {
+	return ObjectClassCache::ClassNameContains(Obj, "TgDeploy_Beacon")
+		&& !ObjectClassCache::ClassNameContains(Obj, "BeaconEntrance");
+}
+
+// First-sight classification: walks the strcmp ladder once per unique
+// UFunction. Returns the matching DispatchTag (or Unknown for the catch-all
+// path). Order kept matching the historical hand-written branches so the
+// behavior of any function name not listed here is unchanged.
+static DispatchTag ClassifyFunction(UFunction* fn) {
+	const char* rawName = fn->GetFullName();
+	if (!rawName) return DispatchTag::Unknown;
+	const std::string nameString = rawName;
+	const char* name = nameString.c_str();
+
+	// Hottest set first: per-tick / per-move noise that we want to pass straight through.
+	if (strcmp(name, "Function Engine.PlayerController.ServerMove") == 0)      return DispatchTag::ServerMove;
+	if (strcmp(name, "Function Engine.PlayerController.OldServerMove") == 0)   return DispatchTag::OldServerMove;
+	if (strcmp(name, "Function Engine.PlayerController.DualServerMove") == 0)  return DispatchTag::DualServerMove;
+	if (strcmp(name, "Function TgGame.TgPlayerController.ShortServerMove") == 0) return DispatchTag::TgShortServerMove;
+	if (strcmp(name, "Function TgGame.TgPlayerController.RMServerMove") == 0) return DispatchTag::TgRMServerMove;
+	if (strcmp(name, "Function Engine.PlayerController.ServerUpdatePing") == 0) return DispatchTag::ServerUpdatePing;
+	if (strcmp(name, "Function Engine.PlayerController.ClientAckGoodMove") == 0) return DispatchTag::ClientAckGoodMove;
+	if (strcmp(name, "Function Engine.PlayerController.ClientAdjustPosition") == 0) return DispatchTag::ClientAdjustPosition;
+	if (strcmp(name, "Function Engine.PlayerController.ShortClientAdjustPosition") == 0) return DispatchTag::ShortClientAdjustPosition;
+	if (strcmp(name, "Function Engine.PlayerController.VeryShortClientAdjustPosition") == 0) return DispatchTag::VeryShortClientAdjustPosition;
+	if (strcmp(name, "Function Engine.PlayerController.LongClientAdjustPosition") == 0) return DispatchTag::LongClientAdjustPosition;
+	if (strcmp(name, "Function Engine.PlayerController.SendClientAdjustment") == 0) return DispatchTag::SendClientAdjustment;
+
+	// Kismet action activations. eventActivated is shared by every sequence
+	// op; the handler below filters by the activated object's class.
+	if (strcmp(name, "Function Engine.SequenceOp.Activated") == 0) return DispatchTag::SeqOpActivated;
+
+	if (   strcmp(name, "Function Engine.Actor.Tick") == 0
+		|| strcmp(name, "Function Engine.GameInfoDataProvider.ProviderInstanceBound") == 0
+		|| strcmp(name, "Function TgGame.TgPawn.ShouldRechargePowerPool") == 0
+		|| strcmp(name, "Function TgGame.TgPawn_Character.Tick") == 0
+		|| strcmp(name, "Function TgGame.TgDeployable.Tick") == 0
+		|| strcmp(name, "Function TgGame.TgMissionObjective.IsLocalPlayerAttacker") == 0
+		|| strcmp(name, "Function TgGame.TgProperty.Copy") == 0
+		|| strcmp(name, "Function TgGame.TgDeploy_BeaconEntrance.Touch") == 0
+		|| strcmp(name, "Function TgGame.TgMissionObjective_Bot.Tick") == 0
+		|| strcmp(name, "Function Engine.Actor.PreBeginPlay") == 0
+		|| strcmp(name, "Function Engine.Actor.SetInitialState") == 0
+		|| strcmp(name, "Function Engine.Actor.PostBeginPlay") == 0
+		|| strcmp(name, "Function Engine.Emitter.PostBeginPlay") == 0
+		|| strcmp(name, "Function Engine.LadderVolume.PostBeginPlay") == 0
+		|| strcmp(name, "Function Engine.KAsset.PostBeginPlay") == 0
+		|| strcmp(name, "Function TgGame.TgRepInfo_Player.Timer") == 0
+		|| strcmp(name, "Function TgGame.GameRunning.Timer") == 0
+		|| strcmp(name, "Function Engine.GameReplicationInfo.Timer") == 0
+		|| strcmp(name, "Function TgGame.TgPawn.GetCameraValues") == 0
+		|| strcmp(name, "Function TgGame_Defense.RoundInProgress.Tick") == 0
+		/* Engine.Actor.Touch handled below */
+		|| strcmp(name, "Function TgGame.TgDeploy_BeaconEntrance.RecheckActiveTimer") == 0
+		|| strcmp(name, "Function TgGame_Arena.RoundInProgress.Tick") == 0
+		|| strcmp(name, "Function TgPawn.Dying.Tick") == 0
+		|| strcmp(name, "Function Engine.GameInfo.Timer") == 0
+		|| strcmp(name, "Function TgGame.TgRepInfo_Game.ServerUpdateTimer") == 0
+		|| strcmp(name, "Function TgGame.TgPawn.IsCrewed") == 0
+		|| strcmp(name, "Function TgGame.TgDevice.IsOffhand") == 0
+		|| strcmp(name, "Function TgGame.TgAIController.SeePlayer") == 0
+		|| strcmp(name, "Function TgGame.TgSkeletalMeshActorNPC.Tick") == 0
+		|| strcmp(name, "Function TgGame.TgSkeletalMeshActor_CharacterBuilder.Tick") == 0
+		|| strcmp(name, "Function TgGame.TgInterpolatingCameraActor.Tick") == 0)
+	{
+		return DispatchTag::EarlyOut;
+	}
+
+	// Specific handlers.
+	// Indestructible-beacon per-tick health watcher — DISABLED (hot path:
+	// every deployable, every frame). Re-enable by uncommenting; the
+	// BeaconHealthWatch case below is kept dormant. Remember to also drop
+	// TgGame.TgDeployable.Tick from the EarlyOut group above when re-enabling.
+	// if (strcmp(name, "Function TgGame.TgDeployable.Tick") == 0
+	// 	|| strcmp(name, "Function TgDeployable.Deploy.Tick") == 0)                   return DispatchTag::BeaconHealthWatch;
+        if (strcmp(name, "Function Engine.Actor.Touch") == 0) return DispatchTag::BossBarrierTouch;
+	if (strcmp(name, "Function TgGame.TgDeployable.TakeDamage") == 0)                return DispatchTag::DeployableTakeDamage;
+    // DIAG: log any damage/kill-related function we have not yet handled
+    if (strstr(name, "Damage") || strstr(name, "Kill") || strstr(name, "Voltage") || strstr(name, "FellOut")) {
+        Logger::Log("debug", "[ProcessEvent] damage-related fn: %s\n", name);
+    }
+	if (strcmp(name, "Function TgGame.TgDeploy_Beacon.DestroyIt") == 0
+		|| strcmp(name, "Function TgGame.TgDeployable.DestroyIt") == 0)              return DispatchTag::BeaconDestroyIt;
+	if (strcmp(name, "Function TgDevice.DeviceFiring.RefireCheckTimer") == 0)        return DispatchTag::RefireCheckTimer;
+	if (strcmp(name, "Function TgGame.TgGame.Login") == 0)                           return DispatchTag::TgGameLogin;
+	if (strcmp(name, "Function TgGame.TgGame.PostLogin") == 0)                       return DispatchTag::TgGamePostLogin;
+	if (strcmp(name, "Function TgGame.TgPlayerController.ClientSetCameraFade") == 0 ||
+	    strcmp(name, "Function TgGame.TgPlayerController.ClientSetCinematicMode") == 0 ||
+	    strcmp(name, "Function TgGame.TgPlayerController.ServerSetViewTarget") == 0 ||
+	    strcmp(name, "Function Engine.PlayerController.ClientSetViewTarget") == 0 ||
+	    strcmp(name, "Function TgGame.TgPlayerController.ForwardToSpectatingMatch") == 0 ||
+	    strcmp(name, "Function TgGame.TgPlayerController.ClientForwardToSpectatingMatch") == 0 ||
+	    strcmp(name, "Function TgGame.TgPlayerController.SpectatingMatch.BeginState") == 0) {
+		return DispatchTag::SpectateVisualState;
+	}
+	if (strcmp(name, "Function TgPawn.Dying.BeginState") == 0)                       return DispatchTag::DyingBeginState;
+	if (strcmp(name, "Function TgDevice.DeviceFiring.EndState") == 0)                return DispatchTag::DeviceFiringEndState;
+	if (strcmp(name, "Function TgDevice.DeviceFiring.BeginState") == 0)              return DispatchTag::DeviceFiringBeginState;
+	if (strcmp(name, "Function TgGame.TgDevice.ServerStopFire") == 0)                return DispatchTag::ServerStopFire;
+	if (strcmp(name, "Function TgGame.TgDevice.ServerStartFire") == 0)               return DispatchTag::ServerStartFire;
+	if (strcmp(name, "Function TgGame.TgEffect.Remove") == 0)                        return DispatchTag::TgEffectRemove;
+	if (strcmp(name, "Function TgGame.TgPawn.WaitForInventoryThenDoPostPawnSetup") == 0) return DispatchTag::PostPawnSetup;
+	if (strcmp(name, "Function TgGame.TgPlayerController.GetPlayerViewPoint") == 0)  return DispatchTag::GetPlayerViewPoint;
+	if (strcmp(name, "Function TgGame.TgDeploy_Beacon.PickUpDeployable") == 0)        return DispatchTag::BeaconPickUpDeployable;
+	if (strcmp(name, "Function TgGame.TgPawn.PickupNearestDeployable") == 0)         return DispatchTag::PawnPickupNearestDeployable;
+	if (strcmp(name, "Function TgGame.TgDeploy_BeaconEntrance.HasExit") == 0)        return DispatchTag::BeaconEntranceHasExit;
+	if (strcmp(name, "Function Engine.PlayerController.Destroyed") == 0)             return DispatchTag::PlayerControllerDestroyed;
+	// Base Pawn.Destroyed catches EVERY pawn (players + all bot subclasses) via
+	// the super.Destroyed() chain (TgPawn_*.Destroyed -> TgPawn.Destroyed ->
+	// super = Engine.Pawn.Destroyed; super calls route through ProcessEvent in
+	// this build, same as the PlayerController.Destroyed match above). One match
+	// covers every teardown path: death/respawn, disconnect, map travel.
+	if (strcmp(name, "Function Engine.Pawn.Destroyed") == 0)                         return DispatchTag::PawnDestroyed;
+	if (strcmp(name, "Function TgGame.TgPlayerController.ServerPickupPutdownDeployable") == 0) return DispatchTag::ServerPickupPutdownDeployableTag;
+	// Engine-timer dispatch of the beacon-entrance teleport (TgPawn.uc:9234).
+	if (strcmp(name, "Function TgGame.TgPawn.TriggerBeaconEntrance") == 0)           return DispatchTag::TgTriggerBeaconEntrance;
+	// Super Agent mode: gate proximity capture for objectives A/B and detect A's
+	// capture. Intercept Tick (which DOES route through ProcessEvent) rather than
+	// the inner CalculateNearByPlayers (an intra-UC call that does not).
+	if (strcmp(name, "Function TgGame.TgMissionObjective_Proximity.Tick") == 0) return DispatchTag::SuperAgentCaptureGate;
+	// Super Agent outside march: the behavior engine fires this event on every
+	// AI action selection; the handler rewrites its (movementCode, destCode)
+	// params for tracked outside marchers. Cached per-UFunction like the rest,
+	// so the hot path is one hash lookup.
+	if (strcmp(name, "Function TgGame.TgAIController.SetWhatToDoNext") == 0) return DispatchTag::SuperAgentMarchDrive;
+        if (strcmp(name, "Function TgGame.TgModifyPawnPropertiesVolume.Touch") == 0) return DispatchTag::BossBarrierTouch;
+	// Escort/payload crush. The payload is a TgObjectiveAttachActor whose
+	// Touch / RanInto / EncroachingOn each do
+	// `if (TgDeployable(Other)) Other.DestroyIt()`. Skip all three for morale
+	// Dome Shields so the payload passes through without destroying them.
+	if (strcmp(name, "Function TgGame.TgObjectiveAttachActor.Touch") == 0 ||
+	    strcmp(name, "Function TgGame.TgObjectiveAttachActor.RanInto") == 0 ||
+	    strcmp(name, "Function TgGame.TgObjectiveAttachActor.EncroachingOn") == 0)
+		return DispatchTag::PayloadDeployableCrush;
+	// Sensor 0.2s proximity poll (engine-timer dispatch, TgDeploy_Sensor.uc:48).
+	// UC's foreach only iterates pawns WITHIN m_fProximityDistance of the sensor,
+	// so a detected pawn that moves beyond that envelope is never removed from
+	// TouchedPlayers and its r_nSensorAlertLevel (HUD "detected" icon) sticks
+	// forever. Post-call sweep removes out-of-range entries.
+	if (strcmp(name, "Function TgGame.TgDeploy_Sensor.CheckPlayersWithInProximity") == 0)
+		return DispatchTag::SensorProximitySweep;
+	// if (IsGameTimerDiagnosticFunction(name)) return DispatchTag::GameTimerDiagnostic;
+
+	// Retail-shipped dev/cheat console commands whose `reliable server`
+	// halves execute here ungated (the UC bodies check nothing — the
+	// original server dropped these for non-GM accounts). Every incoming
+	// client RPC dispatches through ProcessEvent (UnChan.cpp
+	// UActorChannel::ReceivedBunch), so tagging them here intercepts the
+	// whole family. Handled in the DevCheatRpc case below.
+	{
+		static const char kPCPrefix[] = "Function TgGame.TgPlayerController.";
+		if (strncmp(name, kPCPrefix, sizeof(kPCPrefix) - 1) == 0) {
+			const char* fn = name + (sizeof(kPCPrefix) - 1);
+			if (   strcmp(fn, "ServerZeus") == 0                  // god mode
+				|| strcmp(fn, "ServerIcarus") == 0                // fly / no-clip
+				|| strcmp(fn, "ServerApollo") == 0                // unlimited energy
+				|| strcmp(fn, "ServerHades") == 0                 // no cooldowns
+				|| strcmp(fn, "ServerAthena") == 0                // invisible to AI
+				|| strcmp(fn, "ServerElectra") == 0               // r_bIsBot toggle
+				|| strcmp(fn, "ServerChronos") == 0               // mission-timer pause/set
+				|| strcmp(fn, "ServerGotoFly") == 0               // PlayerFlying state
+				|| strcmp(fn, "ServerSetGroundspeed") == 0        // speed hack
+				|| strcmp(fn, "ServerSetGameSpeed") == 0          // global game-speed modifier
+				|| strcmp(fn, "serverdostun") == 0                // self stun/UNstun (escapes enemy stuns)
+				|| strcmp(fn, "ServerChangeTaskForce") == 0       // console team switch — only legit path is the -changeteam chat cmd
+				|| strcmp(fn, "TgSvrExec") == 0                   // arbitrary server console command
+				|| strcmp(fn, "ServerSetValue") == 0              // arbitrary object field write
+				|| strcmp(fn, "ServerGetValue") == 0
+				|| strcmp(fn, "ServerCallKismetEventFromClient") == 0
+				|| strcmp(fn, "ServerTestAwardLoot") == 0
+				|| strcmp(fn, "_ServerSpawnBot") == 0
+				|| strcmp(fn, "_ServerSpawnTemplatePlayer") == 0
+				|| strcmp(fn, "_ServerEquipDevice") == 0          // arbitrary device equip (beacon pickup uses NonPersistAddDevice directly, not this RPC)
+				|| strcmp(fn, "ServerForceBotAction") == 0
+				|| strcmp(fn, "ServerObama") == 0                 // currency grant
+				|| strcmp(fn, "ServerAddToken") == 0
+				|| strcmp(fn, "ServerAddHZPoints") == 0
+				|| strcmp(fn, "ServerGMGiven") == 0
+				|| strcmp(fn, "ServerDevGiveXP") == 0
+				|| strcmp(fn, "ServerSetLevel") == 0
+				|| strcmp(fn, "ServerTestSystemMailItem") == 0    // mail items to any player
+				|| strcmp(fn, "ServerSetPawnAlwaysRelevant") == 0
+				|| strcmp(fn, "ServerTestBeginAssignment") == 0
+				|| strcmp(fn, "ServerTestRequestAssignment") == 0
+				|| strcmp(fn, "ServerTestCloseAllAssignments") == 0
+				|| strcmp(fn, "ServerSimNWCondition") == 0
+				|| strcmp(fn, "ServerGetTraceTime") == 0
+				|| strcmp(fn, "ServerProfiling") == 0
+				|| strcmp(fn, "ServerQuit") == 0)                 // instance shutdown when <2 players
+			{
+				return DispatchTag::DevCheatRpc;
+			}
+		}
+	}
+
+	return DispatchTag::Unknown;
+}
+
+// Pointer-keyed cache: every (UFunction*) maps to a tag forever. UC functions
+// are loaded once and don't move, so this is safe. First call for a given fn
+// pays the strcmp ladder above + one hash insert; every subsequent call is a
+// single hash lookup. After the first ~second of warm-up the cache is
+// populated for everything the game tick touches.
+//
+// Single-threaded by assumption — same as the rest of this hook (the prior
+// implementation's `Logger::ChannelIndents[..]++` would already race on
+// concurrent ProcessEvent invocations). UE3 ProcessEvent fires from the game
+// thread.
+static std::unordered_map<UFunction*, DispatchTag> s_DispatchCache;
+
+static DispatchTag GetDispatchTag(UFunction* fn) {
+	auto it = s_DispatchCache.find(fn);
+	if (it != s_DispatchCache.end()) return it->second;
+	const DispatchTag tag = ClassifyFunction(fn);
+	s_DispatchCache.emplace(fn, tag);
+	return tag;
+}
+
+// "scope" channel investigation — smooth scope-zoom transition broke into an
+// instant snap somewhere around 2026-05-29/30. The smooth-zoom path is
+// entirely client-side (Pawn.Tick → ManageZoomingClientSide → ClientZoomIn →
+// TickZoom lerp), but the SERVER drives r_bAimingMode + applies type-266 aim
+// effect group + may write replicated fields the client camera reads. This
+// instrumentation captures every server-side UC call that touches the aim
+// path AND every direct write to scope-relevant replicated fields, all on
+// ONE dedicated "scope" channel so the user can hand back a single
+// continuous timeline.
+//
+// Cache: first call for any UFunction pays a name lookup + substring check;
+// subsequent calls are O(1) hash lookup. UFunction pointers are stable.
+static std::unordered_map<UFunction*, bool> s_ScopeRelatedCache;
+
+static bool IsScopeRelated(UFunction* fn) {
+	auto it = s_ScopeRelatedCache.find(fn);
+	if (it != s_ScopeRelatedCache.end()) return it->second;
+	const char* raw = fn->GetFullName();
+	const std::string name = raw ? raw : "";
+	const bool match =
+		name.find("ServerUpdateAimingMode")     != std::string::npos ||
+		name.find("ServerUpdateSnipeScopeMode") != std::string::npos ||
+		name.find("ApplyAimEffects")            != std::string::npos ||
+		name.find("RemoveAimEffects")           != std::string::npos ||
+		name.find("EnterAimingMode")            != std::string::npos ||
+		name.find("ExitAimingMode")             != std::string::npos ||
+		name.find("OnAimingModeChange")         != std::string::npos ||
+		name.find("ServerSetBinoculars")        != std::string::npos ||
+		name.find("ManageZoomingClientSide")    != std::string::npos ||
+		name.find("ClientZoomIn")               != std::string::npos ||
+		name.find("ClientZoomOut")              != std::string::npos ||
+		name.find("TickZoom")                   != std::string::npos ||
+		name.find("AdjustFOVAngle")             != std::string::npos ||
+		name.find("ReplicatedEvent")            != std::string::npos ||
+		name.find("PostNetReceive")             != std::string::npos ||
+		name.find("ApplyPawnSetup")             != std::string::npos ||
+		name.find("WaitForInventoryThenDoPostPawnSetup") != std::string::npos;
+	s_ScopeRelatedCache.emplace(fn, match);
+	return match;
+}
+
+// Resolve a TgPawn pointer from the ProcessEvent Object for state logging.
+// Object could be the pawn itself, a TgDevice (Instigator is the pawn), or
+// a TgPlayerController (Pawn member). Returns null if we can't find one.
+static ATgPawn* ResolvePawnForScopeLog(UObject* Object) {
+	if (!Object) return nullptr;
+	const char* clsRaw = Object->Class ? Object->Class->GetFullName() : nullptr;
+	if (!clsRaw) return nullptr;
+	const std::string clsName = clsRaw;
+	if (clsName.find("TgPawn") != std::string::npos) {
+		return (ATgPawn*)Object;
+	}
+	if (clsName.find("TgDevice") != std::string::npos) {
+		ATgDevice* dev = (ATgDevice*)Object;
+		return (ATgPawn*)dev->Instigator;
+	}
+	if (clsName.find("PlayerController") != std::string::npos) {
+		APlayerController* pc = (APlayerController*)Object;
+		return (ATgPawn*)pc->Pawn;
+	}
+	return nullptr;
+}
+
+// Per-call snapshot for the scope channel. Captures the field state of
+// interest BEFORE the UC body runs; the caller emits a paired AFTER log.
+static void LogScopeCall(const char* phase, UObject* Object, UFunction* Function) {
+	const char* fnRaw  = Function->GetFullName();
+	const std::string fnName = fnRaw ? fnRaw : "<null-fn>";
+	const char* objRaw = Object->GetFullName();
+	const std::string objName = objRaw ? objRaw : "<null-obj>";
+
+	ATgPawn* pawn = ResolvePawnForScopeLog(Object);
+	if (pawn) {
+		ATgDevice* wpn = (ATgDevice*)pawn->Weapon;
+		const char* wpnRaw = wpn && wpn->Class ? wpn->Class->GetFullName() : nullptr;
+		const std::string wpnName = wpnRaw ? wpnRaw : "<no-weapon>";
+		Logger::Log("scope",
+			"[%s] %s on %s  r_bAimingMode=%d r_bIsInSnipeScope=%d r_bUsingBinoculars=%d "
+			"weapon=%s r_nBodyMeshAsmId=%d\n",
+			phase, fnName.c_str(), objName.c_str(),
+			(int)pawn->r_bAimingMode, (int)pawn->r_bIsInSnipeScope,
+			(int)pawn->r_bUsingBinoculars,
+			wpnName.c_str(), pawn->r_nBodyMeshAsmId);
+	} else {
+		Logger::Log("scope", "[%s] %s on %s  (no resolvable pawn)\n",
+			phase, fnName.c_str(), objName.c_str());
+	}
+}
+
+void __fastcall UObject__ProcessEvent::Call(UObject* Object, void* edx, UFunction* Function, void* Params, void* Result) {
+	if (!Object || !Function) return;
+
+	const DispatchTag tag = GetDispatchTag(Function);
+
+	// Scope-zoom investigation: log BEFORE every scope-related UC call.
+	// AFTER is logged after the switch dispatch completes (see end of fn).
+	// Gated on channel-enabled so production cost is one hash lookup + one
+	// branch. See the IsScopeRelated comment block for context.
+	const bool scopeLog = Logger::IsChannelEnabled("scope") && IsScopeRelated(Function);
+	if (scopeLog) LogScopeCall("BEFORE", Object, Function);
+
+	// Per-fire-tick refresh for hold-to-sustain stealth. Independent of the
+	// main dispatch — fires alongside whatever the catch-all does for this
+	// function (RefireCheckTimer is not in EarlyOut and has no specific
+	// handler beyond this side effect, so it lands in the catch-all path).
+	//
+	// The UC state machine's DeviceFiring state arms RefireCheckTimer on a
+	// recurring timer while the fire button is held; it stops firing the
+	// moment the button releases. That's exactly the "while firing" signal
+	// we need, and it fires at the device's refire rate (faster than our 1s
+	// effect lifetime for any sane stealth device).
+	//
+	// Previous attempt hooked TgPawn.ApplyStealth but that UC event only
+	// fires when SetProperty(124) is called, which happens only on fire-
+	// start for application_value=156 stealth effect groups (UC's
+	// "Newest Wins" re-submit path discards duplicates instead of
+	// re-applying) — so the refresh never triggered and the effect
+	// expired at 1s regardless of hold duration.
+	if (tag == DispatchTag::RefireCheckTimer) {
+		ATgDevice* Device = (ATgDevice*)Object;
+		if (Device && Device->Instigator && HasStealthEffectGroup(Device)) {
+			RefreshStealthEffectTimers((ATgPawn*)Device->Instigator);
+		}
+	}
+
+	// Catch-all behavior shared by Unknown, RefireCheckTimer (after the side
+	// effect above), and the inner-guard-fail paths in TgEffectRemove /
+	// CheckEffectBuffModifier. The only consumer of Function->GetFullName()
+	// and Object->GetFullName() left in this file lives here, so we gate
+	// the GetFullName + std::string copies behind a channel-enabled check —
+	// in production "hook_calltree" is off and this whole block degrades to
+	// a single CallOriginal with no allocations.
+	auto DoCatchAll = [&]() {
+		if (Logger::IsChannelEnabled(GetLogChannel())) {
+			// Two GetFullName() calls in a single Log line would clobber each
+			// other (shared per-thread buffer in the engine's name-assembly
+			// code), so copy each into its own std::string first.
+			std::string n  = Function->GetFullName();
+			std::string on = Object->GetFullName();
+			Logger::Log(GetLogChannel(), "├─ %s [%s]\n", n.c_str(), on.c_str());
+			Logger::IndentChannel(GetLogChannel(), +1);
+			CallOriginal(Object, edx, Function, Params, Result);
+			Logger::IndentChannel(GetLogChannel(), -1);
+		} else {
+			CallOriginal(Object, edx, Function, Params, Result);
+		}
+	};
+
+	switch (tag) {
+	case DispatchTag::EarlyOut:
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+
+	case DispatchTag::ServerMove: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			FVector* loc = (FVector*)((char*)Params + 0x10);
+			unsigned char flags = *(unsigned char*)((char*)Params + 0x1C);
+			LogMovePingSample("ServerMove", (APlayerController*)Object, ts, flags, loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::OldServerMove: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			unsigned char flags = *(unsigned char*)((char*)Params + 0x07);
+			LogMovePingSample("OldServerMove", (APlayerController*)Object, ts, flags);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::DualServerMove: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x18);
+			FVector* loc = (FVector*)((char*)Params + 0x28);
+			unsigned char flags = *(unsigned char*)((char*)Params + 0x34);
+			LogMovePingSample("DualServerMove", (APlayerController*)Object, ts, flags, loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::TgShortServerMove: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			FVector* loc = (FVector*)((char*)Params + 0x04);
+			unsigned char flags = *(unsigned char*)((char*)Params + 0x10);
+			LogMovePingSample("TgShortServerMove", (APlayerController*)Object, ts, flags, loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::TgRMServerMove: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			FVector* loc = (FVector*)((char*)Params + 0x10);
+			unsigned char flags = *(unsigned char*)((char*)Params + 0x1C);
+			LogMovePingSample("TgRMServerMove", (APlayerController*)Object, ts, flags, loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::ServerUpdatePing: {
+		int newPing = Params ? *(int*)((char*)Params + 0x00) : -1;
+		LogServerUpdatePing((APlayerController*)Object, newPing, "before");
+		CallOriginal(Object, edx, Function, Params, Result);
+		LogServerUpdatePing((APlayerController*)Object, newPing, "after");
+		break;
+	}
+
+	case DispatchTag::ClientAckGoodMove: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			LogClientMoveAckSample("ClientAckGoodMove", (APlayerController*)Object, 0, ts, -1);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::ClientAdjustPosition: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			unsigned char phys = *(unsigned char*)((char*)Params + 0x0C);
+			FVector loc = { *(float*)((char*)Params + 0x10), *(float*)((char*)Params + 0x14), *(float*)((char*)Params + 0x18) };
+			LogClientMoveAckSample("ClientAdjustPosition", (APlayerController*)Object, 1, ts, (int)phys, &loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::ShortClientAdjustPosition: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			unsigned char phys = *(unsigned char*)((char*)Params + 0x0C);
+			FVector loc = { *(float*)((char*)Params + 0x10), *(float*)((char*)Params + 0x14), *(float*)((char*)Params + 0x18) };
+			LogClientMoveAckSample("ShortClientAdjustPosition", (APlayerController*)Object, 2, ts, (int)phys, &loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::VeryShortClientAdjustPosition: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			FVector loc = { *(float*)((char*)Params + 0x04), *(float*)((char*)Params + 0x08), *(float*)((char*)Params + 0x0C) };
+			LogClientMoveAckSample("VeryShortClientAdjustPosition", (APlayerController*)Object, 3, ts, -1, &loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::LongClientAdjustPosition: {
+		if (Logger::IsChannelEnabled("ping") && Params) {
+			float ts = *(float*)((char*)Params + 0x00);
+			unsigned char phys = *(unsigned char*)((char*)Params + 0x0C);
+			FVector loc = { *(float*)((char*)Params + 0x10), *(float*)((char*)Params + 0x14), *(float*)((char*)Params + 0x18) };
+			LogClientMoveAckSample("LongClientAdjustPosition", (APlayerController*)Object, 4, ts, (int)phys, &loc);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::SendClientAdjustment: {
+		LogSendClientAdjustmentSample("before", (APlayerController*)Object);
+		CallOriginal(Object, edx, Function, Params, Result);
+		LogSendClientAdjustmentSample("after", (APlayerController*)Object);
+		break;
+	}
+
+	// case DispatchTag::GameTimerDiagnostic:
+	// 	LogGameTimerSnapshot("before", Object, Function);
+	// 	CallOriginal(Object, edx, Function, Params, Result);
+	// 	LogGameTimerSnapshot("after", Object, Function);
+	// 	break;
+
+	case DispatchTag::GetPlayerViewPoint: {
+		// Sync c_nCameraYawOffset / c_nCameraPitchOffset from Controller.Rotation
+		// before the UC body runs.
+		//
+		// Why: TgPlayerController.GetPlayerViewPoint dispatches to native
+		// CalcCameraView (0x109692c0 -> FUN_10967d30). The pawn-view-target
+		// branch outputs POVRotation = Controller.Rotation ONLY when the PC's
+		// state is PlayerWalking or PlayerHackingBot. For any other state
+		// (PlayerJetting, PlayerFlying, PlayerHanging, ...) it falls through
+		// to a branch that writes:
+		//   POVRotation.Yaw   = this->c_nCameraYawOffset    (offset 0x7B0)
+		//   POVRotation.Pitch = this->c_nCameraPitchOffset  (offset 0x7B4)
+		//
+		// Those offsets are normally refreshed by `state PlayerJetting.PlayerMove`
+		// and `.UpdateRotation` via `PlayerInput.aTurn`/`aLookUp` — but
+		// PlayerInput is client-side; on the dedicated server they stay
+		// frozen at whatever AcknowledgePossession seeded (Pawn.Rotation.Yaw
+		// at first possession, ~0 for pitch). Result: while the jetpack is
+		// firing, GetBaseAimRotation reads a stale POVRotation, the
+		// reticle trace points the wrong way, and projectiles spawn with
+		// the wrong rotation regardless of where the player is aiming.
+		//
+		// Fix: keep these offsets sync'd with the controller's actual
+		// rotation right before any code path that consumes them. We do it
+		// here (rather than per-Tick) so the cost is only paid when somebody
+		// actually reads the view point, and the sync is fresh against the
+		// most-recent ServerMove update.
+		ATgPlayerController* PC = (ATgPlayerController*)Object;
+		if (PC) {
+			PC->c_nCameraYawOffset   = PC->Rotation.Yaw;
+			PC->c_nCameraPitchOffset = PC->Rotation.Pitch;
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::TgGameLogin:
+		// GameInfo.Login (called via super.Login from TgGame.Login) takes the
+		// spectator branch when ChangeTeam returns false (TgGame.ChangeTeam
+		// hardcoded false). It sets PRI.bOnlySpectator/bIsSpectator/bOutOfLives
+		// = true on the new PC.
+		//
+		// Whether those flags get cleared (normal join) or left set
+		// (intentional spectator join) is decided in the TgGamePostLogin case
+		// below, not here: at Login-return time the engine has not yet wired
+		// NewPC->Player to the InPlayer connection (verified empirically —
+		// PC->Player reads as 0x00000000 in this intercept), so we cannot look
+		// up PlayerInfo.is_spectator (or task_force) for this connection yet.
+		// PostLogin resolves the connection via NewPlayer->Player and runs
+		// before SpawnPlayActor's RestartPlayer gate, so it's the right (and
+		// only viable) place to decide.
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+
+	case DispatchTag::TgGamePostLogin: {
+		// Parms layout (AGameInfo_eventPostLogin_Parms / ATgGame_eventPostLogin_Parms):
+		//   0x00 NewPlayer (APlayerController*)
+		//
+		// Runs BEFORE super.PostLogin (called from the UC body of
+		// TgGame.PostLogin) triggers RestartPlayer → FindPlayerStart, and is
+		// the first point NewPlayer->Player is wired up (see TgGameLogin
+		// comment above). Two decisions live here, both keyed off
+		// PlayerInfo.is_spectator — set authoritatively by the control server,
+		// never by the connecting client (see ga_user_roles / spectator join
+		// routing):
+		//   1. Normal join (is_spectator=false): clear bOnlySpectator/
+		//      bIsSpectator/bOutOfLives (forced true by TgGame.Login above,
+		//      because TgGame.ChangeTeam is hardcoded to return false) so
+		//      RestartPlayer takes the spawn branch, and seed PRI.r_TaskForce
+		//      so FindPlayerStart lands in the right room.
+		//   2. Spectator join (is_spectator=true): leave those flags set and
+		//      skip the team seed entirely. RestartPlayer's existing
+		//      bOnlySpectator gate then skips spawning a pawn — no pawn is
+		//      what makes a spectator invisible, uncollidable, and
+		//      unshootable, with no separate hide/no-collide/invulnerability
+		//      hack needed.
+		if (Params) {
+			APlayerController* NewPlayer = *(APlayerController**)Params;
+			// Deliberately NOT requiring NewPlayer->Player here anymore (dropped
+			// from this condition) — see below.
+			if (NewPlayer && NewPlayer->PlayerReplicationInfo) {
+				ATgRepInfo_Player* repInfo = (ATgRepInfo_Player*)NewPlayer->PlayerReplicationInfo;
+
+				// isSpectator/tf default to "normal player" (false/0) and only get
+				// resolved to something else when the connection is actually
+				// available. If NewPlayer->Player is ever null here (an edge case
+				// nobody has hit in practice, per review), the OLD code path
+				// skipped this whole block, silently leaving bOnlySpectator/etc
+				// set on what should be a normal player -- reintroducing the
+				// pre-spectator-mode bug (permanently stuck as spectator,
+				// ViewTarget=self). Defaulting to "not a spectator" instead means
+				// an unresolvable connection fails safe into the old, known-good
+				// unconditional-clear behavior rather than a silent regression.
+				bool isSpectator = false;
+				int tf = 0;
+				int32_t connectionIndex = 0;
+				if (NewPlayer->Player) {
+					connectionIndex = (int32_t)((UNetConnection*)NewPlayer->Player);
+					isSpectator = GClientConnectionsData[connectionIndex].PlayerInfo.is_spectator;
+					tf = GClientConnectionsData[connectionIndex].PlayerInfo.task_force;
+				} else {
+					Logger::Log("spawn",
+						"TgGame.PostLogin intercept: NewPlayer->Player is null -- "
+						"can't resolve connection, defaulting to non-spectator (fail-safe)\n");
+				}
+
+				// Whether a pawn is allowed to spawn is entirely decided by these
+				// three flags — leave them set for spectators (real or
+				// team-assigned) so RestartPlayer's bOnlySpectator gate keeps
+				// skipping the spawn. This is independent of team seeding below.
+				if (!isSpectator) {
+					repInfo->bOnlySpectator = 0;
+					repInfo->bIsSpectator   = 0;
+					repInfo->bOutOfLives    = 0;
+				}
+
+				// Do not pre-write PRI.Team here: native SetTeam compares that field
+				// later, and a pre-write can skip AddPRI or crash duplicate VR joins.
+				// SpawnPlayerCharacter writes the same field later
+				// (TgGame__SpawnPlayerCharacter.cpp:295) but by then the spawn point
+				// has already been chosen, so the wrong-room result persists until
+				// the player dies and respawns.
+				//
+				// Runs for non-spectators AND team-assigned spectators (task_force
+				// 1/2 either way) — a spectator's team here is purely cosmetic (it
+				// drives the client's own same-team HUD health-bar check) and never
+				// spawns a pawn; that's gated solely by whether bOnlySpectator got
+				// cleared above. Teamless spectators keep task_force=0 -> taskforce
+				// stays null -> r_TaskForce untouched. tf was already resolved
+				// above (0 if the connection couldn't be resolved either).
+				ATgRepInfo_TaskForce* taskforce = (tf == 1) ? GTeamsData.Attackers
+				                                  : (tf == 2 ? GTeamsData.Defenders : nullptr);
+				Logger::Log("spawn",
+					"TgGame.PostLogin intercept: conn=%d isSpectator=%d task_force=%d prevTF=%p newTF=%p\n",
+					connectionIndex, (int)isSpectator, tf, (void*)repInfo->r_TaskForce, (void*)taskforce);
+				if (taskforce != nullptr) {
+					repInfo->r_TaskForce = taskforce;
+					repInfo->bNetDirty = 1;
+					repInfo->bForceNetUpdate = 1;
+				}
+
+				if (isSpectator) {
+					// Gates SpectatorOverlayFeed — see ActiveSpectatorCount.hpp.
+					// One increment per spectator connection; the matching
+					// decrement is in NetConnection__Cleanup.cpp.
+					++GActiveSpectatorCount;
+					Logger::Log("spawn",
+						"TgGame.PostLogin intercept: conn=%d spectator join (team_tf=%d) — leaving "
+						"bOnlySpectator/bIsSpectator/bOutOfLives set, pawn spawn stays skipped, "
+						"activeSpectatorCount=%d\n",
+						connectionIndex, tf, GActiveSpectatorCount);
+				}
+			}
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::SpectateVisualState: {
+		if (Logger::IsChannelEnabled("spawn")) {
+			std::string fnName = Function->GetFullName();
+			std::string objName = Object->GetFullName();
+			ATgPlayerController* pc = (ATgPlayerController*)Object;
+			APlayerReplicationInfo* pri = pc ? pc->PlayerReplicationInfo : nullptr;
+			AActor* paramActor = nullptr;
+			if (Params &&
+			    (fnName == "Function TgGame.TgPlayerController.ServerSetViewTarget" ||
+			     fnName == "Function Engine.PlayerController.ClientSetViewTarget")) {
+				paramActor = *(AActor**)Params;
+			}
+
+			int fadeEnable = -1;
+			float fadeAlphaX = 0.0f;
+			float fadeAlphaY = 0.0f;
+			float fadeTime = 0.0f;
+			if (Params && fnName == "Function TgGame.TgPlayerController.ClientSetCameraFade") {
+				fadeEnable = (int)(*(uint32_t*)((char*)Params + 0x00) & 1);
+				fadeAlphaX = *(float*)((char*)Params + 0x08);
+				fadeAlphaY = *(float*)((char*)Params + 0x0C);
+				fadeTime = *(float*)((char*)Params + 0x10);
+			}
+
+			int cinematic = -1;
+			int affectsHud = -1;
+			if (Params && fnName == "Function TgGame.TgPlayerController.ClientSetCinematicMode") {
+				cinematic = (int)(*(uint32_t*)((char*)Params + 0x00) & 1);
+				affectsHud = (int)(*(uint32_t*)((char*)Params + 0x0C) & 1);
+			}
+
+			Logger::Log("spawn",
+				"SpectateVisualState: fn=%s obj=%s pawn=%p viewTarget=%p paramActor=%p "
+				"onlySpec=%d isSpec=%d outOfLives=%d fade=%d alpha=(%.2f,%.2f) fadeTime=%.2f "
+				"cinematic=%d affectsHud=%d\n",
+				fnName.c_str(), objName.c_str(),
+				pc ? pc->Pawn : nullptr, pc ? pc->ViewTarget : nullptr, paramActor,
+				pri ? (int)pri->bOnlySpectator : -1,
+				pri ? (int)pri->bIsSpectator : -1,
+				pri ? (int)pri->bOutOfLives : -1,
+				fadeEnable, fadeAlphaX, fadeAlphaY, fadeTime,
+				cinematic, affectsHud);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::DyingBeginState: {
+		// Beacon carrier-loss BEFORE CallOriginal so the inventory remove
+		// runs while the pawn still owns its InvManager. The original UC
+		// chain doesn't touch the beacon-carry slot directly; without this
+		// the pawn dies, IsCarryingBeacon stays true until the corpse is
+		// fully destroyed, and the team's beacon never respawns.
+		BeaconSdk::DropCarriedBeacon((ATgPawn*)Object);
+
+		// "botdied" diagnostics: dump the factory's kismet BotDied events
+		// (flag bits + TriggerCount) around both possible BotDied call
+		// paths — UC PawnDied inside CallOriginal, and our direct call
+		// below. TriggerCount delta = CheckActivate actually activated.
+		auto LogBotDiedEvents = [](const char* tag, ATgBotFactory* f) {
+			if (f == nullptr) {
+				Logger::Log("botdied", "%s: factory=<null>\n", tag);
+				return;
+			}
+			Logger::Log("botdied", "%s: factory mapId=%d events=%d\n",
+				tag, f->m_nMapObjectId, f->GeneratedEvents.Num());
+			for (int i = 0; i < f->GeneratedEvents.Num(); i++) {
+				USequenceEvent* Evt = f->GeneratedEvents.Data[i];
+				if (Evt == nullptr) continue;
+				Logger::Log("botdied",
+					"  evt[%d] %s trig=%d/%d en=%d playerOnly=%d humanOnly=%d "
+					"clientOnly=%d srvAndCli=%d reTrigDelay=%.1f\n",
+					i, ObjectClassCache::GetClassName(Evt).c_str(),
+					Evt->TriggerCount, Evt->MaxTriggerCount,
+					(int)Evt->bEnabled, (int)Evt->bPlayerOnly,
+					(int)Evt->bHumanOnly, (int)Evt->bClientSideOnly,
+					(int)Evt->bServerAndClientSide, Evt->ReTriggerDelay);
+			}
+		};
+		ATgBotFactory* DiagFactory = nullptr;
+		const bool diagOn = Logger::IsChannelEnabled("botdied");
+		if (diagOn) {
+			ATgPawn* DiagPawn = (ATgPawn*)Object;
+			const char* pnRaw = DiagPawn->GetFullName();
+			const std::string pn(pnRaw ? pnRaw : "<null>");
+			AController* C = DiagPawn->Controller;
+			Logger::Log("botdied",
+				"Dying.BeginState: %s owner=%s ctrl=%s bIsPlayer=%d hench=%d\n",
+				pn.c_str(),
+				DiagPawn->Owner ? ObjectClassCache::GetClassName(DiagPawn->Owner).c_str() : "<none>",
+				C ? ObjectClassCache::GetClassName(C).c_str() : "<none>",
+				C ? (int)C->bIsPlayer : -1,
+				(int)DiagPawn->r_bIsHenchman);
+			if (C && !ObjectClassCache::ClassNameContains(C, "PlayerController")) {
+				DiagFactory = ((ATgAIController*)C)->m_pFactory;
+				LogBotDiedEvents("pre-BeginState", DiagFactory);
+			}
+		}
+
+		CallOriginal(Object, edx, Function, Params, Result);
+
+		if (diagOn && DiagFactory != nullptr) {
+			ATgPawn* DiagPawn = (ATgPawn*)Object;
+			AController* C = DiagPawn->Controller;
+			Logger::Log("botdied",
+				"post-BeginState: ctrl=%s m_pFactory=%s (None => UC PawnDied consumed it)\n",
+				C ? ObjectClassCache::GetClassName(C).c_str() : "<none>",
+				(C && !ObjectClassCache::ClassNameContains(C, "PlayerController") &&
+				 ((ATgAIController*)C)->m_pFactory) ? "set" : "None");
+			LogBotDiedEvents("post-BeginState", DiagFactory);
+		}
+
+		// Dead pawns must not keep PHYS_Flying: retail death set falling
+		// physics, but SetPhysics natives are stripped no-ops on this binary,
+		// so flying bots (Physics=4 hand-set at spawn) stayed flying as
+		// corpses. A flying corpse whose controller is later destroyed crashes
+		// APawn::physicsRotation (0x10ca5330 reads Controller+0x258 BEFORE its
+		// null check) — 2026-06-11 production crash @ 0x10ca5412.
+		{
+			ATgPawn* DyingPawn = (ATgPawn*)Object;
+			if (DyingPawn->Physics == 4 /*PHYS_Flying*/) {
+				DyingPawn->Physics = 2 /*PHYS_Falling*/;
+				DyingPawn->bSimulateGravity = 1;
+			}
+		}
+		// Fallback path: normally UC Dying.BeginState -> Controller.PawnDied
+		// (bIsPlayer=1 on TgAIController) already called the INTACT
+		// TgBotFactory::BotDied inside CallOriginal and nulled m_pFactory
+		// (proven by the 2026-07-15 "botdied" capture). If m_pFactory is
+		// still set here (controller detached before Dying, etc.), call the
+		// intact native @ 0x10a8cbf0 directly. The 2026-06-10 factory
+		// rewrite made m_SpawnQueue a scheduler (one entry per pending
+		// spawn), so the native's respawn-entry append + group-count
+		// decrement compose correctly.
+		//
+		// Kill attribution (m_DeathZoomInfo population + ClientAddKilled RPC)
+		// lives in TgEffect__TrackStats — it fires inside the damage callstack
+		// with direct access to InstigatorPawn, before the state's `Begin:`
+		// latent block ships m_DeathZoomInfo to the client on the next Tick.
+		// We can't do it here because m_LastDamager is never populated:
+		// UpdateDamagers has no UC callers and the binary native that
+		// originally drove it was stripped.
+		ATgPawn* Pawn = (ATgPawn*)Object;
+		// bIsPlayer is unreliable in this build — AI bots default bIsPlayer=true
+		// (it's a "valid combatant" gate, not "has client connection"). Use a
+		// class-name check, per feedback_bIsPlayer_unreliable.md. The intent
+		// here is: this pawn is an AI bot (not a player, not a henchman).
+		if (Pawn->Controller && Pawn->Controller->Class && !Pawn->r_bIsHenchman) {
+			const char* ctrlRaw = Pawn->Controller->Class->GetFullName();
+			const std::string ctrlClass = ctrlRaw ? ctrlRaw : "";
+			const bool isPlayerCtrl = ctrlClass.find("PlayerController") != std::string::npos;
+			if (!isPlayerCtrl) {
+				ATgAIController* AIC = (ATgAIController*)Pawn->Controller;
+				if (AIC->m_pFactory) {
+					if (Logger::IsChannelEnabled(GetLogChannel())) {
+						const char* pnRaw = Pawn->GetFullName();
+						const std::string pnName = pnRaw ? pnRaw : "<null>";
+						Logger::Log(GetLogChannel(), "Dying.BeginState: calling BotDied on factory for %s\n", pnName.c_str());
+					}
+					ATgBotFactory* CalledFactory = AIC->m_pFactory;
+					((void(__thiscall*)(ATgBotFactory*, ATgPawn*, ATgAIController*))0x10a8cbf0)(AIC->m_pFactory, Pawn, AIC);
+					AIC->m_pFactory = nullptr;
+					if (diagOn) LogBotDiedEvents("post-direct-BotDied", CalledFactory);
+				} else if (diagOn) {
+					Logger::Log("botdied", "direct call skipped: m_pFactory already None\n");
+				}
+			}
+		}
+		break;
+	}
+
+	case DispatchTag::PostPawnSetup: {
+		Logger::Log("flying", "WaitForInventoryThenDoPostPawnSetup called on %s\n",
+			Object ? Object->GetFullName() : "<null>");
+		// Hook target: `Function TgGame.TgPawn.WaitForInventoryThenDoPostPawnSetup`.
+		//
+		// We do NOT hook `PostPawnSetup` directly — UC subclass overrides call
+		// `super.PostPawnSetup()` which compiles to `EX_FinalFunction` (direct
+		// dispatch, bypasses ProcessEvent). The base-class hook never fires
+		// for flying-class subclasses that override PostPawnSetup. The outer
+		// WaitForInventoryThenDoPostPawnSetup, by contrast, is called from C++
+		// via the SDK ProcessEvent wrapper at SpawnBotById time and re-entered
+		// from the engine's SetTimer dispatch — both paths route through
+		// ProcessEvent, so this hook fires reliably.
+		//
+		// UC body (TgPawn.uc:6690):
+		//   simulated function WaitForInventoryThenDoPostPawnSetup() {
+		//       if (inventory_ready)  PostPawnSetup();   // sets PHYS_Falling
+		//       else                  SetTimer(0.1, 'WaitFor...');
+		//   }
+		//
+		// The function polls recursively until inventory is ready. We apply
+		// the physics fix after every iteration — idempotent for non-firing
+		// iterations, corrects the SetPhysics(2) clobber on the firing one.
+		// The fix has to live here because the recovery paths the original
+		// game relied on (subclass SetMovementPhysics override, the stripped
+		// InitializeHoverBot native, the Pawn::PossessedBy non-vehicle branch)
+		// are all gone in this build.
+		CallOriginal(Object, edx, Function, Params, Result);
+
+		ATgPawn* Pawn = (ATgPawn*)Object;
+		const char* className = Pawn->Class ? Pawn->Class->GetFullName() : nullptr;
+
+		// Diagnostic snapshot: dump everything we know about the bot's
+		// transform/visual state. Uses typed SDK accessors — earlier raw
+		// offsets were wrong (bot_id off m_pAmBot was bogus 567 for every
+		// bot, cylinder offsets 0x158/0x154 are pre-UE3 layout, mesh ptr
+		// read worked but returned default). Read directly via the typed
+		// field names so we get the real values.
+		{
+			int botIdLog = Pawn->r_nProfileId;  // set by SpawnBotById to bot_id
+			float cylH = -1.0f, cylR = -1.0f;
+			if (Pawn->CylinderComponent) {
+				cylH = Pawn->CylinderComponent->CollisionHeight;
+				cylR = Pawn->CylinderComponent->CollisionRadius;
+			}
+			float meshTransX = 999.0f, meshTransY = 999.0f, meshTransZ = 999.0f;
+			float meshScale = -1.0f;
+			if (Pawn->Mesh) {
+				meshTransX = Pawn->Mesh->Translation.X;
+				meshTransY = Pawn->Mesh->Translation.Y;
+				meshTransZ = Pawn->Mesh->Translation.Z;
+				meshScale  = Pawn->Mesh->Scale;
+			}
+			Logger::Log("flying",
+				"BotPose: botId=%d class=%s Location=(%.1f,%.1f,%.1f) DrawScale=%.3f "
+				"CylinderR=%.1f CylinderH=%.1f Mesh.Translation=(%.1f,%.1f,%.1f) MeshComp.Scale=%.3f "
+				"m_fMeshScale=%.3f m_fBaseTranslationOffset=%.1f m_fCrouchTranslationOffset=%.1f "
+				"Physics=%d\n",
+				botIdLog,
+				className ? className : "<no-class>",
+				Pawn->Location.X, Pawn->Location.Y, Pawn->Location.Z,
+				Pawn->DrawScale,
+				cylR, cylH,
+				meshTransX, meshTransY, meshTransZ,
+				meshScale,
+				Pawn->m_fMeshScale,
+				Pawn->m_fBaseTranslationOffset,
+				Pawn->m_fCrouchTranslationOffset,
+				(int)Pawn->Physics);
+		}
+
+		// Flying-class detection: pawn class strstr — only classes whose UC
+		// `SetMovementPhysics` override actually calls `SetPhysics(4)`. Scanner
+		// is NOT one of these: it extends `TgPawn_Robot`, not `TgPawn_Hover`,
+		// inherits the default PHYS_Walking, and uses a tall primary cylinder
+		// (35×70 → 140uu) to LOOK like it's hovering while the cylinder bottom
+		// rests on the ground. Adding it here put the chassis into PHYS_Flying
+		// and broke that ground-anchored illusion.
+                const bool flyingClass = className &&
+                        (strstr(className, "TgPawn_Hover")           ||
+                         strstr(className, "TgPawn_FlyingBoss")      ||
+                         strstr(className, "TgPawn_AttackTransport") ||
+                         strstr(className, "TgPawn_ColonyEye")       ||
+                         strstr(className, "TgPawn_NewWasp"));
+
+		// Per-bot whitelist for ground-class pawns mounting a flying mesh.
+		// See reference_bot_vehicle_possess_skips_setphysics.md for rationale.
+		// Read bot_id off `m_pAmBot.Dummy + 0x1C` — set by SpawnBotById before
+		// WaitForInventoryThenDoPostPawnSetup schedules this event.
+		bool flyingBotId = false;
+		void* BotConfig = (void*)Pawn->m_pAmBot.Dummy;
+		if (BotConfig) {
+			const int botId = *(int*)((char*)BotConfig + 0x1C);
+			flyingBotId = (botId == 1107 || botId == 1657);
+		}
+
+		// Clear `bDriving` (APawn +0x3D0 bit 0x01, CPF_Net) on every bot
+		// regardless of class. `AIController->Possess(Bot, 0, /*vehicleTransition=*/1)`
+		// in SpawnBotById sets it true via the engine's vehicle-mode possession
+		// path — that puts the pawn into "driver pose" anim blending (sitting/
+		// hunched in a cockpit), which renders as a crouched mesh while the
+		// collision cylinder stays full size. UC never references bDriving, so
+		// it's pure engine territory; clearing it directly lets the bot's
+		// normal stand/walk anim play. Matches the user's empirical
+		// observation that bots appear crouched until possessed (crewing
+		// toggles driver state via r_ControlPawn back-refs).
+		//
+		// Also clear bDriverIsVisible (bit 0x02) for sanity — the standalone
+		// bot isn't a passenger of anything.
+		unsigned int& driverBits = *(unsigned int*)((char*)Pawn + 0x3D0);
+		driverBits &= ~0x00000003u;
+		Pawn->bNetDirty = 1;
+		Pawn->bForceNetUpdate = 1;
+
+		if (flyingClass || flyingBotId) {
+			// Stack 1 — Engine physics mode: PHYS_Flying.
+			Pawn->Physics = 4;
+
+			// Stack 2 — Engine gating bits at APawn +0x1EC.
+			// In UE3 physFlying, if `bCanFly` is false the engine immediately
+			// transitions back to physFalling. CDO defaults set it true on
+			// every flying class, but force it here in case spawn path or
+			// PostPawnSetup ever loses it. Clear `bSimulateGravity` so the
+			// engine's gravity integrator doesn't accelerate the pawn down.
+			//   bit 0x00002000 = bCanFly
+			//   bit 0x00040000 = bSimulateGravity (clear)
+			//   bit 0x00000800 = bCanWalk          (leave alone — most flying
+			//                    classes can still walk if they touch ground)
+			unsigned int& engineBits = *(unsigned int*)((char*)Pawn + 0x1EC);
+			engineBits |= 0x00002000u;
+			engineBits &= ~0x00040000u;
+
+			// Stack 3 — game-custom SoftZ gravity (TgPawn +0x3D8 bit 0x40000000).
+			// All three flying classes (Hover, FlyingBoss, ColonyEye) override
+			// `m_bAffectedBySoftZ=false` in their UC defaultproperties — that's
+			// the game's reinvented vertical-pull system. If the CDO override
+			// isn't honored at instance time (we've seen this with other
+			// CDO-based defaults), the flying bot inherits TgPawn's parent
+			// default of `true` and SoftZ pulls it down regardless of Physics
+			// mode. Force-clear here.
+			unsigned int& tgBits = *(unsigned int*)((char*)Pawn + 0x3D8);
+			tgBits &= ~0x40000000u;
+
+			Pawn->bNetDirty = 1;
+			Pawn->bForceNetUpdate = 1;
+			if (Logger::IsChannelEnabled("flying")) {
+				Logger::Log("flying",
+					"PostPawnSetup: applied PHYS_Flying + bCanFly + clear SoftZ for %s (class=%s)\n",
+					Pawn->GetFullName(), className ? className : "<no-class>");
+			}
+		}
+		break;
+	}
+
+
+	case DispatchTag::DeviceFiringBeginState: {
+		// Rest device (864): expose r_nRestDeviceSlot only WHILE resting.
+		// InterruptRestDevice (client+server per-tick CheckInterrupt) uses it to
+		// stop an in-progress rest on movement; a permanently-set slot makes it
+		// call StopFire(864) every tick instead, flooding the flash queue and
+		// clearing the client's shared range-node m_bPendingFire each frame
+		// (kills every INTERRUPT_FIRE_ANIM_ON_REFIRE='n' held fire anim).
+		{
+			ATgDevice* Dev = (ATgDevice*)Object;
+			if (Dev && Dev->m_bIsRestDevice && Dev->Instigator) {
+				((ATgPawn*)Dev->Instigator)->r_nRestDeviceSlot = (int)Dev->r_eEquippedAt;
+			}
+			// Device-usage stats: one "use" per DeviceFiring activation
+			// (per hold for continuous fire, per activation for one-shots
+			// like waves/boosts — the denominator for effectiveness rates).
+			if (Dev && Dev->Instigator &&
+			    ObjectClassCache::ClassNameContains(Dev->Instigator, "TgPawn")) {
+				MatchStats::OnDeviceUsed((ATgPawn*)Dev->Instigator, Dev->r_nDeviceId);
+			}
+		}
+		DoCatchAll();
+		break;
+	}
+
+	case DispatchTag::DeviceFiringEndState: {
+		// Rest device: rest over → hide the slot again (see BeginState above).
+		{
+			ATgDevice* Dev = (ATgDevice*)Object;
+			if (Dev && Dev->m_bIsRestDevice && Dev->Instigator) {
+				((ATgPawn*)Dev->Instigator)->r_nRestDeviceSlot = -1;
+			}
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		ATgDevice* Device = (ATgDevice*)Object;
+
+		// Beacon deploy cleanup. UC TgDevice.uc:2877 fires ConsumeDevice when
+		// r_bConsumedOnUse is set, but ConsumeDevice's RemoveConsumableFromOwnerInventory
+		// native only does HUD sync — it doesn't actually remove the device from
+		// the pawn's inventory.  The original Deploy native presumably did that
+		// work; ours just spawns the deployable.  Without inventory cleanup the
+		// beacon would linger in m_EquippedDevices[11] and the control-server's
+		// device-bar slot would never clear.
+		//
+		// Calling NonPersistRemoveDevice HERE — after CallOriginal — is crucial:
+		// CallOriginal runs the client-side `if (m_bUsesDeployMode &&
+		// Instigator.Weapon == self) ChangeToPreviousWeapon()` (TgDevice.uc:2871)
+		// while Pawn->Weapon is still the beacon.  Only after that do we clear
+		// the slot, so the race that drove the weapon to melee is gone.
+		//
+		// Gate ONLY on m_bIsBeaconPlacing — r_bConsumedOnUse is a consumables
+		// concept (different device category we don't have implemented yet) and
+		// isn't reliably set on beacon devices.  TgInventoryManager.NonPersistAddDevice
+		// sets m_bIsBeaconPlacing=1 explicitly when nEquipPoint==11, so any
+		// device firing DeviceFiring.EndState with that bit set is a
+		// carry-beacon and should be removed from inventory after the deploy.
+		{
+			uint32_t devFlags = *(uint32_t*)((char*)Device + 0x22C);
+			bool bIsBeaconPlacing = (devFlags & 0x10000u) != 0;
+			int nEquipPoint = (int)Device->r_eEquippedAt;
+			// Hot path — EndState fires for EVERY device fire cycle; the
+			// unconditional entry log flooded captures. Rare beacon-cleanup
+			// logs below remain.
+			// Logger::Log("beacon",
+			// 	"DeviceFiring.EndState: device=0x%p devId=%d invId=%d slot=%d "
+			// 	"devFlags=0x%08x m_bIsBeaconPlacing=%d instigator=0x%p\n",
+			// 	Device, Device->r_nDeviceId, Device->r_nInventoryId, nEquipPoint,
+			// 	devFlags, (int)bIsBeaconPlacing, Device->Instigator);
+			if (bIsBeaconPlacing && Device->Instigator) {
+				ATgPawn* Pawn = (ATgPawn*)Device->Instigator;
+				ATgInventoryManager* InvMgr = (ATgInventoryManager*)Pawn->InvManager;
+				if (InvMgr && nEquipPoint >= 1 && nEquipPoint <= 24) {
+					// Two cases:
+					//   A. Device is the CURRENT slot occupant (1st deploy): normal
+					//      cleanup — NonPersistRemoveDevice clears the slot + IPC.
+					//   B. Device is an ORPHAN from a prior cleanup whose state
+					//      machine fired EndState late (2nd+ deploy): slot 11 now
+					//      holds a different (NEW) device. We can't just clean the
+					//      slot because we'd kill the NEW beacon. Instead, drop
+					//      the orphan's m_bIsBeaconPlacing bit + sever its
+					//      Instigator so any further state-machine ticks no-op,
+					//      AND re-issue cleanup for whatever beacon currently
+					//      occupies the slot (NEW), since that's the one the
+					//      player just deployed.
+					ATgDevice* slotDev = Pawn->m_EquippedDevices[nEquipPoint];
+					if (slotDev == Device) {
+						Logger::Log("beacon",
+							"DeviceFiring.EndState: post-deploy cleanup pawn=0x%p device=0x%p slot=%d (current occupant)\n",
+							Pawn, Device, nEquipPoint);
+						TgInventoryManager__NonPersistRemoveDevice::Call(InvMgr, nullptr, nEquipPoint);
+					} else {
+						uint32_t slotFlags = slotDev ? *(uint32_t*)((char*)slotDev + 0x22C) : 0u;
+						bool slotIsBeacon = slotDev && (slotFlags & 0x10000u) != 0;
+						Logger::Log("beacon",
+							"DeviceFiring.EndState: orphan EndState fired — slot=%d holds 0x%p (beacon=%d). "
+							"Detaching orphan + cleaning slot occupant.\n",
+							nEquipPoint, slotDev, (int)slotIsBeacon);
+						// Detach orphan so its state machine can't side-effect
+						// further: clear m_bIsBeaconPlacing (so this gate stops
+						// firing for it), null its Instigator (so any future
+						// state-scoped UC code that touches Instigator no-ops),
+						// and reset r_eEquippedAt so any future lookups don't
+						// route back to slot 11.
+						*(uint32_t*)((char*)Device + 0x22C) &= ~0x10000u;
+						Device->Instigator   = nullptr;
+						Device->r_eEquippedAt = 0;
+						// Clean the NEW beacon currently in the slot — that's
+						// the one the player actually just deployed.
+						if (slotIsBeacon) {
+							TgInventoryManager__NonPersistRemoveDevice::Call(InvMgr, nullptr, nEquipPoint);
+						}
+					}
+				}
+			}
+		}
+		break;
+	}
+
+	case DispatchTag::ServerStartFire: {
+		// Diagnostic: capture every gate `TgDevice.CanDeviceFireNow` reads,
+		// then run CallOriginal and check whether the device's state actually
+		// transitioned to DeviceBuildup (=gate passed) or stayed in Active
+		// (=gate failed). Goal: pinpoint why server rejects in-hand-weapon
+		// fire while client accepted it (firing-while-jetpacking → no
+		// projectile / no hitscan damage on server, client renders the shot).
+		//
+		// AVOID SDK `eventXxx` wrappers that return `bool` — the generated
+		// SDK code returns `Parms.ReturnValue` where ReturnValue is a
+		// 1-bit bitfield in a stack-allocated Parms struct. UC's UnrealVM
+		// writes the bit, but reads sometimes pick up stack garbage instead
+		// (observed: `knockedDown=1 dying=1` simultaneously impossible,
+		// `IsFiring=0` on a device whose state is DeviceFiring). Use direct
+		// memory reads + state-name strcmp instead.
+		//
+		// Channel: "fire_gate" (in control-server.json).
+		bool wantLog = Logger::IsChannelEnabled("fire_gate");
+		const char* stateBefore = nullptr;
+		if (wantLog) {
+			ATgDevice* Device = (ATgDevice*)Object;
+			if (Device) {
+				ATgPawn*  Pawn = (ATgPawn*)Device->Instigator;
+				AWeapon*  Wpn  = Pawn ? Pawn->Weapon : nullptr;
+				int       fm   = (int)Device->CurrentFireMode;
+				UTgDeviceFire* FireMode =
+					(fm >= 0 && fm < Device->m_FireMode.Count)
+						? Device->m_FireMode.Data[fm] : nullptr;
+				stateBefore = Device->GetStateName().GetName();
+
+				// Read GIsNonCombat directly (the SDK wrapper for IsNonCombat
+				// is unreliable). We force it to 0 in combat at engine init,
+				// but still want to surface it for diagnosis.
+				int isNonCombat = *(int*)0x119A01C5;
+
+				Logger::Log("fire_gate",
+					"[ServerStartFire] device=%p devId=%d type=%d offHand=%d handDev=%d "
+					"usesDeploy=%d stealthDev=%d fm=%d/%d stateBefore=%s\n",
+					Device,
+					Device->r_nDeviceId, Device->m_nDeviceType,
+					(int)Device->m_bIsOffHand, (int)Device->m_bHandDevice,
+					(int)Device->m_bUsesDeployMode, (int)Device->r_bIsStealthDevice,
+					fm, Device->m_FireMode.Count,
+					stateBefore ? stateBefore : "<null>");
+
+				if (Pawn) {
+					const char* pawnState = Pawn->GetStateName().GetName();
+
+					// Aim-rotation source-of-truth dump. The projectile spawn
+					// rotation = `Rotator(Vector(GetAdjustedAim(StartTrace)))`,
+					// which routes through `TgPawn.GetBaseAimRotation` →
+					// `PC.GetPlayerViewPoint`. So Pawn.Rotation, Controller
+					// Rotation, AND GetPlayerViewPoint output are the three
+					// candidate sources of the wrong yaw observed during
+					// flight (projectile spawned with rot=(0, 32760, 0) =
+					// fixed -X direction, vs ground rot=(-460, -13936, 0)).
+					AController* Ctl = Pawn->Controller;
+					FVector  pvLoc  = {0,0,0};
+					FRotator pvRot  = {0,0,0};
+					if (Ctl) {
+						Ctl->eventGetPlayerViewPoint(&pvLoc, &pvRot);
+					}
+
+					Logger::Log("fire_gate",
+						"  pawn=%p physics=%d weapon=%p (self==weapon? %d) controller=%p\n"
+						"  flags: GIsNonCombat=%d isHacking=%d isDecoy=%d "
+						"binoculars=%d offhandCooldownNet=%d offhandCooldownLocal=%d\n"
+						"  flags: disableAllDevices=%d disableAction=%d aimingMode=%d\n"
+						"  state=%s  power=%.2f\n"
+						"  pawn.Rotation     =(p=%d, y=%d, r=%d)\n"
+						"  ctrl.Rotation     =(p=%d, y=%d, r=%d)\n"
+						"  PlayerViewPoint   =(p=%d, y=%d, r=%d) at loc=(%.1f, %.1f, %.1f)\n",
+						Pawn, (int)Pawn->Physics, Wpn, (int)(Wpn == (AWeapon*)Device), Ctl,
+						isNonCombat, (int)Pawn->r_bIsHacking, (int)Pawn->r_bIsDecoy,
+						(int)Pawn->r_bUsingBinoculars, (int)Pawn->r_bInGlobalOffhandCooldown,
+						(int)Pawn->bInGlobalOffhandCooldownClient,
+						(int)Pawn->r_bDisableAllDevices, (int)Pawn->c_bDisableAction,
+						(int)Pawn->r_bAimingMode,
+						pawnState ? pawnState : "<null>",
+						Pawn->r_fCurrentPowerPool,
+						Pawn->Rotation.Pitch, Pawn->Rotation.Yaw, Pawn->Rotation.Roll,
+						Ctl ? Ctl->Rotation.Pitch : 0,
+						Ctl ? Ctl->Rotation.Yaw   : 0,
+						Ctl ? Ctl->Rotation.Roll  : 0,
+						pvRot.Pitch, pvRot.Yaw, pvRot.Roll,
+						pvLoc.X, pvLoc.Y, pvLoc.Z);
+				}
+
+				if (FireMode) {
+					// `eventAmountCurrentlyOffOfTargetAccuracy` returns float
+					// (not bool) so its SDK wrapper IS reliable. The gate at
+					// TgDevice.uc:968 fails if this is > 0.0001 while
+					// m_bRequireAimMode is set.
+					float accOff = Device->eventAmountCurrentlyOffOfTargetAccuracy(Device->CurrentFireMode);
+					Logger::Log("fire_gate",
+						"  firemode: fireType=%d cont=%d restrictInCombat=%d "
+						"requireAimMode=%d restrictFireFlags=0x%x restrictPhysFlags=0x%x "
+						"attackRate=%.3f accuracyOff=%.4f\n",
+						(int)FireMode->m_nFireType,
+						(int)FireMode->m_bContinuousFire,
+						(int)FireMode->m_bRestrictInCombat,
+						(int)FireMode->m_bRequireAimMode,
+						FireMode->m_nRestrictFiringFlags,
+						FireMode->m_nRestrictPhysicsFlags,
+						FireMode->GetAttackRate(),
+						accOff);
+				}
+
+				if (Pawn) {
+					// Jetpack-slot dump. Compare state via strcmp instead of
+					// the broken `eventIsFiring()` SDK call. UC's DeviceFiring
+					// state override returns IsFiring=true, but the SDK
+					// wrapper returns garbage.
+					ATgDevice* JP = nullptr;
+					for (int i = 0; i < 15; ++i) {
+						ATgDevice* d = Pawn->m_EquippedDevices[i];
+						if (d && d->m_nDeviceType == 806) { JP = d; break; }
+					}
+					if (JP) {
+						const char* jpState = JP->GetStateName().GetName();
+						bool jpFiring = jpState && (strcmp(jpState, "DeviceFiring") == 0 ||
+						                            strcmp(jpState, "DeviceBuildup") == 0);
+						Logger::Log("fire_gate",
+							"  jetpack: dev=%p state=%s offHand=%d handDev=%d devType=%d "
+							"isFiring(stateName)=%d isPawnWeapon=%d\n",
+							JP, jpState ? jpState : "<null>",
+							(int)JP->m_bIsOffHand, (int)JP->m_bHandDevice, JP->m_nDeviceType,
+							(int)jpFiring,
+							(int)(Pawn->Weapon == (AWeapon*)JP));
+					} else {
+						Logger::Log("fire_gate", "  jetpack: <no TGDT_TRAVEL device equipped>\n");
+					}
+				}
+			}
+		}
+
+		CallOriginal(Object, edx, Function, Params, Result);
+
+		// Did the gate pass? StartFire's success path is `GotoState('DeviceBuildup')`
+		// (TgDevice.uc:1411). If the device's state is now DeviceBuildup or
+		// DeviceFiring, the gate passed; if it's still in its pre-call state
+		// (typically 'Active'), CanDeviceFireNow returned false. This is the
+		// ground-truth verdict — beats any SDK wrapper call.
+		if (wantLog) {
+			ATgDevice* Device = (ATgDevice*)Object;
+			if (Device) {
+				const char* stateAfter = Device->GetStateName().GetName();
+				bool passed = stateAfter && (strcmp(stateAfter, "DeviceBuildup") == 0 ||
+				                             strcmp(stateAfter, "DeviceFiring") == 0);
+				Logger::Log("fire_gate",
+					"  verdict: stateBefore=%s -> stateAfter=%s  GATE %s\n",
+					stateBefore ? stateBefore : "<null>",
+					stateAfter ? stateAfter : "<null>",
+					passed ? "PASSED (fire dispatched)" : "FAILED (no fire)");
+
+				// Aim-rotation cache dump — POST-CallOriginal so we see the
+				// value computed during THIS fire's ProjectileFire chain.
+				// `TgPawn.GetBaseAimRotation` (TgPawn.uc:7892) caches its
+				// result into `m_CachedBaseAimRotation` at offset 0x15D4 of
+				// TgPawn (per SDK header). The cache is per-tick, so reading
+				// it now gives this shot's computed aim. Compare against
+				// ctrl.Rotation / PlayerViewPoint logged earlier — if they
+				// differ, the shooting-reticle branch at TgPawn.uc:7889
+				// (OutRotation = Rotator(HitLocation - WeaponLoc)) is what
+				// overrode the rotation. The c_bUsesShootingReticle flag
+				// from the cached camera-values struct tells us whether
+				// that branch is even being taken; it lives at offset 0x1574
+				// of TgPawn, with c_bUsesShootingReticle being bit 0x01 of
+				// the first dword.
+				ATgPawn* Pawn = (ATgPawn*)Device->Instigator;
+				if (Pawn) {
+					FRotator& cachedAim = *(FRotator*)((char*)Pawn + 0x15D4);
+					unsigned int camFlags = *(unsigned int*)((char*)Pawn + 0x1574);
+					bool usesReticle = (camFlags & 0x1) != 0;
+					Logger::Log("fire_gate",
+						"  cached aim @ TgPawn+0x15D4 = (p=%d, y=%d, r=%d)  "
+						"c_bUsesShootingReticle=%d\n\n",
+						cachedAim.Pitch, cachedAim.Yaw, cachedAim.Roll,
+						(int)usesReticle);
+				} else {
+					Logger::Log("fire_gate", "\n");
+				}
+			}
+		}
+		break;
+	}
+
+	case DispatchTag::ServerStopFire: {
+		// Stealth is a "hold-to-sustain" buff and the 1s-promoted lifetime
+		// would leave the HUD icon visible for up to a second after the
+		// user releases fire. Tear it down immediately on fire-release
+		// for snappier UX. RemoveEffectGroupsByCategory matches clones by
+		// m_nCategoryCode (not pointer), runs our RemoveEffects on each,
+		// and hits the symmetric UC Remove path — m_fRaw restores
+		// correctly.
+		//
+		// Other device categories rely on UC's native
+		// remove path (LifeOver timer or explicit RemoveEffectType). Our
+		// RemoveEffectGroup now matches clones by egId when the caller
+		// passes a template, so scope-out, rest-end, etc. all work
+		// natively without any bracket.
+		CallOriginal(Object, edx, Function, Params, Result);
+		// ATgDevice* Device = (ATgDevice*)Object;
+		// if (Device && Device->Instigator && HasStealthEffectGroup(Device)) {
+		// 	ATgPawn* Pawn = (ATgPawn*)Device->Instigator;
+		// 	ATgEffectManager* Mgr = Pawn->r_EffectManager;
+		// 	if (Mgr) {
+		// 		TgEffectManager__RemoveEffectGroupsByCategory::Call(
+		// 			Mgr, nullptr, /*nCategoryCode=*/621, /*nQuantity=*/99);
+		// 	}
+		// }
+		break;
+	}
+
+	case DispatchTag::TgEffectRemove:
+		// Passthrough. Correct own-class dispatch is done by RemoveEffects /
+		// DispatchEffectRemove (the SDK eventRemove wrapper resolves only the
+		// base TgEffect.Remove, so buffs are dispatched explicitly there).
+		DoCatchAll();
+		break;
+
+	// Note: `Function TgGame.TgEffect.CheckEffectBuffModifier` previously had
+	// a PE-time guard here that did SDK-caller damage-mod scaling. With the
+	// native fully reimplemented at 0x10a6f270 (see
+	// `TgEffect__CheckEffectBuffModifier`), both UC bytecode and SDK callers
+	// reach the same native body — keeping a PE hook here would double-apply.
+	// Removed; SDK callers now follow the default catch-all path which
+	// CallOriginal's down to the native.
+
+	case DispatchTag::PawnPickupNearestDeployable: {
+		// Diagnostic: dump pawn->Touching contents so we can see whether the
+		// beacon is even in the touching set. If it's not, the pickup chain
+		// stops here (UC iterates `TouchingActors(TgDeployable, deployable)`).
+		ATgPawn* Pawn = (ATgPawn*)Object;
+		Logger::Log("beacon", "PickupNearestDeployable: ENTER pawn=0x%p\n", Pawn);
+		if (Pawn) {
+			// Touching is an AActor TArray at offset 0x100 on AActor (per SDK).
+			struct ArrPtr { AActor** Data; int Count; int Max; };
+			ArrPtr* touching = reinterpret_cast<ArrPtr*>((char*)Pawn + 0x100);
+			Logger::Log("beacon",
+				"PickupNearestDeployable: pawn=0x%p Touching.Count=%d Touching.Data=%p\n",
+				Pawn, touching->Count, touching->Data);
+			for (int i = 0; i < touching->Count; ++i) {
+				AActor* other = touching->Data[i];
+				if (!other) continue;
+				const char* clsName = (other->Class ? other->Class->GetFullName() : "<null>");
+				bool isDep = clsName && strstr(clsName, "TgDeploy") != nullptr;
+				Logger::Log("beacon",
+					"  Touching[%d] = 0x%p class=%s%s\n",
+					i, other, clsName ? clsName : "<null>",
+					isDep ? " <- candidate" : "");
+				if (isDep) {
+					ATgDeployable* dep = (ATgDeployable*)other;
+					Logger::Log("beacon",
+						"    deployableId=%d m_nPickupDeviceId=%d s_bWasPickedUp=%d "
+						"m_bPickupOnlyOnce=%d m_bInDestroyedState=%d r_DRI=0x%p\n",
+						dep->r_nDeployableId, dep->m_nPickupDeviceId,
+						(int)dep->s_bWasPickedUp, (int)dep->m_bPickupOnlyOnce,
+						(int)dep->m_bInDestroyedState, dep->r_DRI);
+				}
+			}
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		// Log the return value (Parms layout: ATgPawn_eventPickupNearestDeployable_Parms
+		// has just a bool ReturnValue at offset 0x0)
+		if (Params) {
+			bool ret = (*(uint32_t*)Params & 1u) != 0;
+			Logger::Log("beacon", "PickupNearestDeployable: EXIT returned %s\n", ret ? "true" : "false");
+		}
+		break;
+	}
+
+	case DispatchTag::BeaconPickUpDeployable: {
+		// Diagnostic: log every gate value before the UC body runs so we
+		// know exactly which check is blocking pickup.
+		ATgDeploy_Beacon* beacon = (ATgDeploy_Beacon*)Object;
+		ATgPawn* pReceiver = nullptr;
+		if (Params) {
+			pReceiver = *(ATgPawn**)Params;
+		}
+		Logger::Log("beacon", "PickUpDeployable: ENTER beacon=0x%p pReceiver=0x%p\n", beacon, pReceiver);
+		if (beacon) {
+			ATgRepInfo_Deployable* dri = beacon->r_DRI;
+			ATgRepInfo_Player* recvPri = pReceiver ? (ATgRepInfo_Player*)pReceiver->PlayerReplicationInfo : nullptr;
+			ATgRepInfo_TaskForce* recvTf = recvPri ? recvPri->r_TaskForce : nullptr;
+
+			bool canBePickedUp = (beacon->m_nPickupDeviceId > 0)
+				&& !beacon->s_bWasPickedUp
+				&& beacon->m_bPickupOnlyOnce;
+
+			Logger::Log("beacon",
+				"PickUpDeployable[entry]: beacon=0x%p pReceiver=0x%p\n"
+				"  m_nPickupDeviceId=%d s_bWasPickedUp=%d m_bPickupOnlyOnce=%d -> CanBePickedUp=%s\n"
+				"  m_bInDestroyedState=%d\n"
+				"  beacon.r_DRI=0x%p instigatorInfo=0x%p tfInfo=0x%p bOwnedByTf=%d\n"
+				"  receiver.PRI=0x%p receiver.PRI.r_TaskForce=0x%p\n"
+				"  hp=%d driCur=%d driMax=%d pct=%.4f dmgDuringDeploy=%.1f state=%s\n",
+				beacon, pReceiver,
+				beacon->m_nPickupDeviceId, (int)beacon->s_bWasPickedUp, (int)beacon->m_bPickupOnlyOnce,
+				canBePickedUp ? "TRUE" : "FALSE",
+				(int)beacon->m_bInDestroyedState,
+				dri, dri ? dri->r_InstigatorInfo : nullptr, dri ? dri->r_TaskforceInfo : nullptr,
+				dri ? (int)dri->r_bOwnedByTaskforce : -1,
+				recvPri, recvTf,
+				beacon->r_nHealth,
+				dri ? dri->r_nHealthCurrent : -1, dri ? dri->r_nHealthMaximum : -1,
+				dri ? dri->r_fDeployMaxHealthPCT : -99.0f,
+				beacon->m_fDamagedDuringDeploy,
+				beacon->GetStateName().GetName() ? beacon->GetStateName().GetName() : "<null>");
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		if (Params) {
+			bool ret = (*(uint32_t*)((char*)Params + 4) & 1u) != 0;
+			Logger::Log("beacon", "PickUpDeployable: EXIT returned %s\n", ret ? "true" : "false");
+		}
+		// The percent the UC body just saved (SetHealthPercent(GetSaveHealthPercent()))
+		// is the deploy-max PCT the NEXT redeploy will consume. Picked up while in
+		// Deploy state, GetSaveHealthPercent = (deployMax - dmgDuringDeploy)/max —
+		// which can be <= 0 or > 1; picked up while Active it's hp/max.
+		if (beacon && beacon->r_DRI && beacon->r_DRI->r_TaskforceInfo) {
+			ATgTeamBeaconManager* mgr = beacon->r_DRI->r_TaskforceInfo->r_BeaconManager;
+			if (mgr) {
+				Logger::Log("beacon",
+					"PickUpDeployable[saved]: mgr=0x%p s_fHealthPercent=%.4f\n",
+					mgr, mgr->s_fHealthPercent);
+			}
+		}
+		break;
+	}
+
+	case DispatchTag::ServerPickupPutdownDeployableTag: {
+		// Pickup-key RPC. Run the UC body first — its TouchingActors walk in
+		// `PickupNearestDeployable` handles factory beacons (which were in
+		// the world long enough for the player to walk into their cylinder)
+		// and any other deployable the player has physically entered.
+		CallOriginal(Object, edx, Function, Params, Result);
+
+		// Spawn-while-overlapping fallback. UE3 fires `Touch` on collision
+		// ENTRY — a beacon spawned around a stationary pawn never registers
+		// in the pawn's Touching list, so UC's PickupNearestDeployable can't
+		// find it even with the pawn standing on top of it. Check the team's
+		// registered beacon by distance and pick it up manually if eligible.
+		//
+		// Skip when UC already did the pickup (it set s_bWasPickedUp on the
+		// world beacon or cleared mgr->r_Beacon via DestroyIt/UnRegister) —
+		// the gates below catch both cases.
+		APlayerController* PC = (APlayerController*)Object;
+		ATgPawn* Pawn = PC ? (ATgPawn*)PC->Pawn : nullptr;
+		if (!Pawn || !Pawn->PlayerReplicationInfo) break;
+		ATgRepInfo_Player* pri = (ATgRepInfo_Player*)Pawn->PlayerReplicationInfo;
+		if (!pri->r_TaskForce || !pri->r_TaskForce->r_BeaconManager) break;
+		ATgTeamBeaconManager* mgr = pri->r_TaskForce->r_BeaconManager;
+		ATgDeploy_Beacon* beacon = mgr->r_Beacon;
+		if (!beacon) break;
+		if (beacon->m_bInDestroyedState) break;
+		if (beacon->s_bWasPickedUp) break;
+		if (beacon->m_nPickupDeviceId <= 0) break;
+		if (!beacon->m_bPickupOnlyOnce) break;
+		// Pickup during the Deploy phase is allowed — the entrance teleport
+		// still gates on m_bIsDeployed via the BeaconEntranceHasExit hook,
+		// so picking up mid-deploy correctly cancels both the deploy and the
+		// (not-yet-active) entrance link.
+
+		// Proximity: 64uu XY radius covers a player standing on or next to a
+		// beacon (beacon CollisionCylinder radius is ~34uu in DB, player
+		// cylinder ~18uu, so combined ~52uu — round up to 64 for headroom).
+		// Z difference up to 80uu allowed so the player can be jumping over
+		// it and still trigger pickup.
+		float dx = Pawn->Location.X - beacon->Location.X;
+		float dy = Pawn->Location.Y - beacon->Location.Y;
+		float dz = Pawn->Location.Z - beacon->Location.Z;
+		float xyDistSq = dx*dx + dy*dy;
+		if (xyDistSq > 64.f * 64.f) break;
+		if (dz < -80.f || dz > 80.f) break;
+
+		// Manual dispatch of UC PickUpDeployable. ProcessEvent re-enters our
+		// dispatcher → BeaconPickUpDeployable case logs entry/exit. UC body
+		// handles inventory add + DestroyIt + UnRegister.
+		Logger::Log("beacon",
+			"ServerPickupPutdown: fallback firing for beacon=0x%p dist=%.0fuu (UC TouchingActors missed it)\n",
+			beacon, sqrtf(xyDistSq));
+		const bool picked = beacon->PickUpDeployable(Pawn);
+		Logger::Log("beacon",
+			"  fallback PickUpDeployable returned %s\n", picked ? "true" : "false");
+		break;
+	}
+
+	case DispatchTag::PlayerControllerDestroyed: {
+		// Disconnect cleanup: if this controller's pawn was carrying a beacon
+		// for one of the team managers, drop it and respawn at the team's
+		// original-priority factory. Pre-CallOriginal so the pawn / InvManager
+		// chain is still wired when we issue the inventory remove.
+		APlayerController* PC = (APlayerController*)Object;
+		if (PC && PC->Pawn) {
+			BeaconSdk::DropCarriedBeacon((ATgPawn*)PC->Pawn);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::PawnDestroyed: {
+		// Drop this pawn's entries from our pawnId-keyed bookkeeping maps so
+		// they don't accumulate for the life of the instance. This fires via
+		// the super.Destroyed() chain for EVERY pawn — players and bots — on
+		// every teardown path (death/respawn, disconnect, map travel), which
+		// is why we clean here rather than at the player-only connect/respawn
+		// sites. Purely memory hygiene: the maps are pawnId-keyed, so a stale
+		// entry can never be mis-matched to a live pawn either way.
+		//
+		// Post-CallOriginal: the engine frees the actor only after the whole
+		// Destroyed chain returns, so the pawn is still valid here. Guard the
+		// cast with a class-name check — r_nPawnId lives on ATgPawn, not the
+		// base APawn, so reading it off a non-Tg pawn would be out-of-bounds.
+		CallOriginal(Object, edx, Function, Params, Result);
+		if (ObjectClassCache::ClassNameContains(Object, "TgPawn")) {
+			ATgPawn* Pawn = (ATgPawn*)Object;
+			Inventory::ClearTracking(Pawn);
+			Armor::ClearRecords(Pawn);
+		}
+		break;
+	}
+
+	case DispatchTag::BeaconEntranceHasExit: {
+		// UC HasExit (TgDeploy_BeaconEntrance.uc:122) returns
+		// `beaconManager.GetBeacon() != none` — i.e. true the moment
+		// `r_Beacon` is non-null, regardless of deploy phase. UC's
+		// `Deploy.BeginState` calls `RegisterBeacon(self, false)` which sets
+		// `r_Beacon` before the deploy animation completes, so without this
+		// gate the entrance teleport unlocks the instant a player throws a
+		// beacon — well before its visible deploy timer runs out.
+		//
+		// Gate the result on `r_Beacon->m_bIsDeployed` (flipped to 1 by UC
+		// `TgDeployable::DeployComplete` after `r_fTimeToDeploySecs` elapses,
+		// AND for factory-spawned beacons by `WireDeployableOwnership` at
+		// spawn time — those keep their immediate-active behavior).
+		//
+		// Parms layout: ATgDeploy_BeaconEntrance_eventHasExit_Parms has just
+		// `bool ReturnValue` at offset 0 (bitfield :1).
+		CallOriginal(Object, edx, Function, Params, Result);
+		if (!Params) break;
+		uint32_t* retPtr = (uint32_t*)Params;
+		const bool ret = (*retPtr & 1u) != 0;
+		if (!ret) break;  // already false, nothing to gate
+		ATgDeploy_BeaconEntrance* entrance = (ATgDeploy_BeaconEntrance*)Object;
+		if (!entrance || !entrance->r_DRI) break;
+		// Resolve the entrance's team manager via its DRI. Factory-spawned
+		// entrances get r_TaskforceInfo set by WireDeployableOwnership in
+		// TgBeaconFactory::SpawnObject; that points at the team's tfri whose
+		// r_BeaconManager owns the matching exit beacon.
+		ATgRepInfo_TaskForce* tfri = entrance->r_DRI->r_TaskforceInfo;
+		ATgTeamBeaconManager* mgr = tfri ? tfri->r_BeaconManager : nullptr;
+		if (!mgr || !mgr->r_Beacon) break;
+		if (!mgr->r_Beacon->m_bIsDeployed) {
+			*retPtr = 0;  // clear the bool — entrance stays inactive
+		}
+		break;
+	}
+
+	case DispatchTag::TgTriggerBeaconEntrance: {
+		// Teammate beacon teleport. Resolve the same way the UC body does
+		// (TgPawn.uc:9234): team beacon manager → r_Beacon → Instigator
+		// (deployer). Pre-call so the beacon still exists when we read it.
+		ATgPawn* P = (ATgPawn*)Object;
+		ATgRepInfo_Player* PRI = P
+			? (ATgRepInfo_Player*)P->PlayerReplicationInfo : nullptr;
+		if (PRI && PRI->r_TaskForce && PRI->r_TaskForce->r_BeaconManager) {
+			ATgDeploy_Beacon* beacon = PRI->r_TaskForce->r_BeaconManager->r_Beacon;
+			if (beacon && beacon->Instigator &&
+			    (ATgPawn*)beacon->Instigator != P) {
+				MatchStats::OnBeaconSpawnUsed(P, (ATgPawn*)beacon->Instigator);
+			}
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	case DispatchTag::SeqOpActivated: {
+		CallOriginal(Object, edx, Function, Params, Result);
+		// Trace every game-specific kismet op activation — actions whose
+		// original-server native body is missing activate without effect;
+		// this trace is how we spot them on real maps.
+		if (Logger::IsChannelEnabled("kismet")
+		 && ObjectClassCache::ClassNameContains(Object, "TgSeq")) {
+			const char* onRaw = Object->GetFullName();
+			const std::string opName(onRaw ? onRaw : "<null>");
+			Logger::Log("kismet", "[%s] kismet op activated: %s\n",
+				Logger::GetTime(), opName.c_str());
+		}
+		// TgSeqAct_AlarmBots: the original server's native Activated() raised
+		// the global alarm; this binary lacks it, and the base SequenceAction
+		// handler-dispatch does nothing when Target is empty (typical wiring).
+		if (ObjectClassCache::ClassNameContains(Object, "TgSeqAct_AlarmBots")) {
+			ATgGame* Game = (ATgGame*)Globals::Get().GGameInfo;
+			if (Game != nullptr) {
+				const char* anRaw = Object->GetFullName();
+				const std::string actName(anRaw ? anRaw : "<null>");
+				Logger::Log("alarm",
+					"[%s] kismet action activated: %s -> ActivateAlarm(originator=none, id=0)\n",
+					Logger::GetTime(), actName.c_str());
+				// Null originator is a designed-in path: the intact native
+				// picks a random player pawn as the alarm target.
+				TgGame__ActivateAlarm::Call(Game, nullptr, nullptr, 0, 0, 0, 0);
+			}
+		}
+		// TgSeqAct_EndMission: same disconnection — the original server native
+		// ended the mission with the winner encoded by which input pin fired.
+		// Map kismet is the canonical end driver for scripted missions.
+		if (ObjectClassCache::ClassNameContains(Object, "TgSeqAct_EndMission")) {
+			UTgSeqAct_EndMission* Act = (UTgSeqAct_EndMission*)Object;
+			ATgGame* Game = (ATgGame*)Globals::Get().GGameInfo;
+			if (Game != nullptr) {
+				// Pins: 0=In (no winner override), 1=Attackers Win,
+				// 2=Defenders Win. m_GameWinState: 1=defenders, 2=attackers.
+				if (Act->InputLinks.Count > 1 && Act->InputLinks.Data[1].bHasImpulse) {
+					Game->m_GameWinState = 2;
+					TgGame__UpdateMissionTimerEventWinVar::Call(Game, nullptr);
+				} else if (Act->InputLinks.Count > 2 && Act->InputLinks.Data[2].bHasImpulse) {
+					Game->m_GameWinState = 1;
+					TgGame__UpdateMissionTimerEventWinVar::Call(Game, nullptr);
+				}
+				Logger::Log("endmission",
+					"kismet TgSeqAct_EndMission: winState=%u camera=%p delaySecs=%d nextMapGameId=%d\n",
+					(unsigned)Game->m_GameWinState, (void*)Act->m_SpectatorCamera,
+					Act->m_nDelay, Act->m_nNextMapGameId);
+				BeginEndMissionImpl(Game, Act->m_SpectatorCamera, (float)Act->m_nDelay);
+			}
+		}
+		// TgSeqAct_GetPlayerCount: same stripped-Activated() disconnection. The
+		// engine op lifecycle still runs around the stub — outputs fire
+		// (DeActivated) and m_fPlayerCount is copied into the linked "Players"
+		// SeqVar_Float afterwards (PopulateLinkedVariableValues) — so every
+		// player-count chain executed with a count of 0. That silently killed
+		// the 2p/3p/4p extra-factory toggles (SDColony02-06, Solar Farm waves)
+		// and made DN_Defense_Solar_Farm_P always unload the group-boss
+		// sublevel ("A <= 2" branch). eventActivated lands between the stripped
+		// native and the publish, so filling the count here is sufficient.
+		// m_nTaskForce 0 (every dumped map) = all players.
+		if (ObjectClassCache::ClassNameContains(Object, "TgSeqAct_GetPlayerCount")) {
+			UTgSeqAct_GetPlayerCount* Act = (UTgSeqAct_GetPlayerCount*)Object;
+			ATgGame* Game = (ATgGame*)Globals::Get().GGameInfo;
+			float fCount = 0.0f;
+			if (Game != nullptr) {
+				if (Act->m_nTaskForce > 0 && Game->GameReplicationInfo != nullptr) {
+					AGameReplicationInfo* GRI = Game->GameReplicationInfo;
+					for (int i = 0; i < GRI->PRIArray.Num(); i++) {
+						ATgRepInfo_Player* PRI = (ATgRepInfo_Player*)GRI->PRIArray.Data[i];
+						if (PRI == nullptr || PRI->bBot) continue;
+						if (PRI->r_TaskForce != nullptr &&
+						    PRI->r_TaskForce->r_nTaskForce == Act->m_nTaskForce) {
+							fCount += 1.0f;
+						}
+					}
+				} else {
+					fCount = (float)Game->NumPlayers;
+				}
+			}
+			Act->m_fPlayerCount = fCount;
+			Logger::Log("kismet", "TgSeqAct_GetPlayerCount: taskforce=%d -> %.0f players\n",
+				Act->m_nTaskForce, fCount);
+		}
+		// TgSeqAct_SetUITextBox: the ally announcer callouts ("North Door!",
+		// "Satellite Strike imminent!", "Defend Bancroft", etc.). Same stripped-
+		// Activated() disconnection — the native dispatch that calls
+		// OnSetUITextBox on the target players is gone, so nothing fires.
+		// OnSetUITextBox -> AddAlertScript can't be reproduced via ProcessEvent
+		// either: AddAlertScript has no FUNC_NetClient, so a server-side call runs
+		// locally on the headless server (no HUD) and never reaches clients
+		// (reference_alert_dispatcher_734). The server-reachable path is the
+		// CHAT_MESSAGE piggyback (SendAlert), exactly what AddKillAlert uses. The
+		// target is TgSeqVar_Player ("the players") → broadcast to everyone
+		// (co-op defense: all human players are on one team).
+		if (ObjectClassCache::ClassNameContains(Object, "TgSeqAct_SetUITextBox")) {
+			UTgSeqAct_SetUITextBox* Act = (UTgSeqAct_SetUITextBox*)Object;
+			// Start pin (0) shows the alert; Stop pin (1) would remove it. We only
+			// reproduce the show path — the VO callouts all fire Start; the Stop
+			// pin (persistent objective banners) has no CHAT_MESSAGE remove twin.
+			const bool startImpulse =
+				Act->InputLinks.Count > 0 && Act->InputLinks.Data[0].bHasImpulse;
+			const bool stopImpulse =
+				Act->InputLinks.Count > 1 && Act->InputLinks.Data[1].bHasImpulse;
+			if (startImpulse && !stopImpulse) {
+				// Priority mirrors TgPawn.OnSetUITextBox: secondary -> APT_Normal(1),
+				// else APT_High(2). Type = TextBox_MessageType (AlertType enum).
+				const unsigned char priority = Act->TextBox_TargetSecondary ? 1 : 2;
+				const unsigned char type     = Act->TextBox_MessageType;
+				// Duration from the "Duration" SeqVar_Float varLink. Designers wire
+				// it even when TextBox_UseDuration is off; fall back to a readable
+				// default if absent / non-positive so the callout doesn't flash.
+				float duration = 5.0f;
+				for (int v = 0; v < Act->VariableLinks.Num(); v++) {
+					const FSeqVarLink& vl = Act->VariableLinks.Data[v];
+					char desc[64] = {0};
+					if (vl.LinkDesc.Data && vl.LinkDesc.Count > 0)
+						wcstombs(desc, vl.LinkDesc.Data, sizeof(desc) - 1);
+					if (strcmp(desc, "Duration") != 0) continue;
+					for (int k = 0; k < vl.LinkedVariables.Num(); k++) {
+						USequenceVariable* var = vl.LinkedVariables.Data[k];
+						if (var && ObjectClassCache::ClassNameContains(var, "SeqVar_Float")) {
+							const float f = ((USeqVar_Float*)var)->FloatValue;
+							if (f > 0.0f) duration = f;
+							break;
+						}
+					}
+					break;
+				}
+				SendAlert::Broadcast(Act->TextBox_MessageID, priority, type, duration);
+				Logger::Log("announcer",
+					"kismet TgSeqAct_SetUITextBox: msgId=%d type=%d pri=%d dur=%.1f -> broadcast\n",
+					Act->TextBox_MessageID, (int)type, (int)priority, duration);
+			}
+		}
+		// Diagnostic: eventActivated fires after the native compare, so ValueA/B
+		// hold what the compare actually saw.
+		if (Logger::IsChannelEnabled("kismetdestroy")
+		 && ObjectClassCache::ClassNameContains(Object, "SeqCond_CompareInt")) {
+			USeqCond_CompareInt* Cond = (USeqCond_CompareInt*)Object;
+			const char* cRaw = Object->GetFullName();
+			const std::string cName(cRaw ? cRaw : "<null>");
+			Logger::Log("kismetdestroy", "compare: %s ValueA=%d ValueB=%d\n",
+				cName.c_str(), Cond->ValueA, Cond->ValueB);
+		}
+		// SeqAct_Destroy on map-baked (bNoDelete) actors. Retail path: base
+		// SequenceAction handler dispatch -> Actor.OnDestroy -> ShutDown() ->
+		// ForceNetRelevant() (RemoteRole flip + forced-initial bookkeeping), so
+		// the hide/collision reaches clients. On our server the SDColony06 side-
+		// room barriers stayed up, so drive the bNoDelete branch of OnDestroy
+		// here ourselves: eventShutDown() (idempotent if the handler already ran;
+		// InterpActor's override only adds a checkpoint flag) + the playtested
+		// CtrRecursiveDoors net-flip on top.
+		if (ObjectClassCache::ClassNameContains(Object, "SeqAct_Destroy")) {
+			USequenceOp* Op = (USequenceOp*)Object;
+			if (Logger::IsChannelEnabled("kismetdestroy")) {
+				const char* oRaw = Object->GetFullName();
+				const std::string oName(oRaw ? oRaw : "<null>");
+				Logger::Log("kismetdestroy", "activated: %s (varLinks=%d)\n",
+					oName.c_str(), Op->VariableLinks.Count);
+			}
+			for (int li = 0; li < Op->VariableLinks.Count; li++) {
+				TArray<USequenceVariable*>& vars = Op->VariableLinks.Data[li].LinkedVariables;
+				for (int vi = 0; vi < vars.Count; vi++) {
+					USequenceVariable* var = vars.Data[vi];
+					if (!var || !ObjectClassCache::ClassNameContains(var, "SeqVar_Object")) continue;
+					UObject* held = ((USeqVar_Object*)var)->ObjValue;
+					if (!held) continue;
+					// Actor-ness via SuperField walk (IsA is unreliable on this build).
+					bool isActor = false;
+					for (UClass* c = held->Class; c; c = (UClass*)((UField*)c)->SuperField) {
+						if (ObjectClassCache::GetClassName(c) == "Class Engine.Actor") { isActor = true; break; }
+					}
+					if (!isActor) continue;
+					AActor* a = (AActor*)held;
+					if (!a->bNoDelete) continue;  // deletable targets replicate their destruction natively
+					a->eventShutDown();  // hide + collision off + ForceNetRelevant
+					// Belt-and-suspenders: the exact playtested CTR formula.
+					a->bStatic = 0;
+					a->RemoteRole = 1;  // ROLE_SimulatedProxy
+					a->bAlwaysRelevant = 1;
+					a->SetHidden(1);           // bHidden        — CPF_Net
+					a->SetCollision(0, 0, 0);  // bCollide/Block — CPF_Net
+					a->bNetDirty = 1;
+					a->bForceNetUpdate = 1;
+					if (Logger::IsChannelEnabled("kismetdestroy")) {
+						const char* araw = a->GetFullName();
+						const std::string aname(araw ? araw : "<null>");
+						Logger::Log("kismetdestroy",
+							"  shut down bNoDelete target %s at (%.0f,%.0f,%.0f)\n",
+							aname.c_str(), a->Location.X, a->Location.Y, a->Location.Z);
+					}
+				}
+			}
+		}
+		break;
+	}
+
+	// Super Agent mode gate on the proximity objective's Tick. Skipping the
+	// CallOriginal freezes the capture math (CalculateNearByPlayers never runs,
+	// so m_fCurrCaptureTime is untouched — no add, no decay, no status change).
+	// OnCaptureTick runs UNCONDITIONALLY afterward (lifecycle detection + the
+	// per-frame escape mechanics must keep ticking even while capture is frozen,
+	// e.g. the periodic escape alarm while players are off-point). It early-
+	// returns for every objective that isn't our A, and for non-Super-Agent matches.
+	case DispatchTag::PayloadDeployableCrush: {
+		// Payload crush immunity for the Robotics Morale Dome Shield. The escort
+		// payload is a TgObjectiveAttachActor; its Touch / RanInto /
+		// EncroachingOn each call `if (TgDeployable(Other)) Other.DestroyIt()`.
+		// For a self-spawning force-field dome, skip the whole handler so the
+		// DestroyIt never runs and the payload passes through it. Turrets
+		// (Suicide) and other deployables are unaffected — only self-spawn domes
+		// match. `Other` is param 0. EncroachingOn returns bool at Params+4
+		// (Touch/RanInto are void — must NOT write past their smaller Parms).
+		AActor* other = Params ? *(AActor**)Params : nullptr;
+		if (other &&
+		    ObjectClassCache::ClassNameContains(other, "TgDeploy_ForceField") &&
+		    DeployableClassify::DeploysOnSelf(((ATgDeployable*)other)->r_nDeployableId)) {
+			const char* fn = Function->GetFullName();
+			if (fn && strstr(fn, "EncroachingOn")) {
+				if (Params) *(uint32_t*)((char*)Params + 4) = 0;  // ReturnValue = false (don't stop)
+				if (Result) *(uint32_t*)Result = 0;
+			}
+			break;  // skip CallOriginal → no dome.DestroyIt()
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	// Stale-detection sweep for deployed sensors. The UC poll's
+	// `foreach AllPawns(..., Location, m_fProximityDistance)` never iterates a
+	// pawn outside that radius, so RemovePlayerFromList is unreachable for
+	// pawns that left the envelope — their s_nSensorAlertList slot (and the
+	// replicated r_nSensorAlertLevel HUD icon) stayed set forever. Walk each
+	// config's TouchedPlayers after the original and remove anyone beyond that
+	// config's radius; RemovePlayerFromList recomputes the pawn's alert level.
+	case DispatchTag::SensorProximitySweep: {
+		CallOriginal(Object, edx, Function, Params, Result);
+		ATgDeploy_Sensor* sensor = (ATgDeploy_Sensor*)Object;
+		for (int idx = 0; idx < sensor->m_DeploySensorConfig.Count; ++idx) {
+			FDeploySensorConfig& cfg = sensor->m_DeploySensorConfig.Data[idx];
+			const float maxDistSq = cfg.fProximityDistance * cfg.fProximityDistance;
+			// Reverse walk — RemovePlayerFromList does RemoveItem on this array.
+			for (int i = cfg.TouchedPlayers.Count - 1; i >= 0; --i) {
+				ATgPawn* p = cfg.TouchedPlayers.Data[i];
+				if (!p) continue;
+				const float dx = p->Location.X - sensor->Location.X;
+				const float dy = p->Location.Y - sensor->Location.Y;
+				const float dz = p->Location.Z - sensor->Location.Z;
+				if (dx * dx + dy * dy + dz * dz <= maxDistSq) continue;
+				sensor->RemovePlayerFromList(p, idx);
+			}
+		}
+		break;
+	}
+
+	case DispatchTag::SuperAgentCaptureGate: {
+		ATgMissionObjective_Proximity* Obj = (ATgMissionObjective_Proximity*)Object;
+		if (SuperAgent::ShouldRunCapture(Obj)) {
+			CallOriginal(Object, edx, Function, Params, Result);
+		}
+		SuperAgent::OnCaptureTick(Obj);
+		break;
+	}
+
+	// Super Agent outside march. SetWhatToDoNext(nMovementCode, nMoveDestination)
+	// — two ints at Params+0 / Params+4. The override rewrites them in place for
+	// tracked outside marchers (no-op for everything else), then the original
+	// runs with the (possibly) rewritten action.
+	case DispatchTag::SuperAgentMarchDrive: {
+		if (Params) {
+			SuperAgent::OverrideMarchMovement((ATgAIController*)Object,
+				(int*)Params, (int*)((char*)Params + 4));
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	// —— Indestructible-beacon diagnostics (channel "beacon") ————————————
+	// UC TakeDamage is the ONLY damage→destroy path for deployables; a live
+	// beacon that ignores damage is either never reached here, or eaten by
+	// one of the entry gates (r_bTakeDamage=0, r_nHealth<=0 zombie, or
+	// m_bInDestroyedState husk). Log the gates before and the result after.
+	case DispatchTag::DeployableTakeDamage: {
+		const bool isBeacon = IsExitBeacon(Object);
+		ATgDeployable* d = (ATgDeployable*)Object;
+		if (isBeacon) {
+			ATgRepInfo_Deployable* dri = d->r_DRI;
+			Logger::Log("beacon",
+				"TakeDamage ENTER beacon=0x%p dmg=%d hp=%d driCur=%d driMax=%d pct=%.4f "
+				"takeDmg=%d destroyed=%d tearOff=%d state=%s\n",
+				d, Params ? *(int*)Params : -1, d->r_nHealth,
+				dri ? dri->r_nHealthCurrent : -1, dri ? dri->r_nHealthMaximum : -1,
+				dri ? dri->r_fDeployMaxHealthPCT : -99.0f,
+				(int)d->r_bTakeDamage, (int)d->m_bInDestroyedState, (int)d->bTearOff,
+				d->GetStateName().GetName() ? d->GetStateName().GetName() : "<null>");
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		if (isBeacon) {
+			Logger::Log("beacon",
+				"TakeDamage EXIT  beacon=0x%p hp=%d destroyed=%d\n",
+				d, d->r_nHealth, (int)d->m_bInDestroyedState);
+		}
+		break;
+	}
+
+	// DestroyIt no-ops on m_bInDestroyedState or bTearOff — if either is
+	// already set when a kill arrives, the husk stays in the world forever.
+	case DispatchTag::BeaconDestroyIt: {
+		if (IsExitBeacon(Object)) {
+			ATgDeployable* d = (ATgDeployable*)Object;
+			Logger::Log("beacon",
+				"DestroyIt ENTER beacon=0x%p hp=%d destroyed=%d tearOff=%d lifeSpan=%.2f\n",
+				d, d->r_nHealth, (int)d->m_bInDestroyedState, (int)d->bTearOff,
+				d->LifeSpan);
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	// Per-tick change watcher. UC-internal writers (TickDeploy ramp,
+	// UpdateHealth calls from UC bytecode) never cross a hook — sampling the
+	// fields every Tick catches every writer, one log line per change.
+	case DispatchTag::BeaconHealthWatch: {
+		if (!IsExitBeacon(Object)) {
+			CallOriginal(Object, edx, Function, Params, Result);
+			break;
+		}
+		ATgDeployable* b = (ATgDeployable*)Object;
+		ATgRepInfo_Deployable* dri = b->r_DRI;
+		struct BeaconSnap {
+			int hp, driCur, driMax;
+			float pct;
+			int destroyed, tearOff, takeDmg, deployed;
+		};
+		static std::unordered_map<UObject*, BeaconSnap> s_beaconSnaps;
+		BeaconSnap cur;
+		cur.hp        = b->r_nHealth;
+		cur.driCur    = dri ? dri->r_nHealthCurrent : -1;
+		cur.driMax    = dri ? dri->r_nHealthMaximum : -1;
+		cur.pct       = dri ? dri->r_fDeployMaxHealthPCT : -99.0f;
+		cur.destroyed = (int)b->m_bInDestroyedState;
+		cur.tearOff   = (int)b->bTearOff;
+		cur.takeDmg   = (int)b->r_bTakeDamage;
+		cur.deployed  = (int)b->m_bIsDeployed;
+		auto it = s_beaconSnaps.find(Object);
+		const bool changed = (it == s_beaconSnaps.end())
+			|| it->second.hp != cur.hp || it->second.driCur != cur.driCur
+			|| it->second.driMax != cur.driMax || it->second.pct != cur.pct
+			|| it->second.destroyed != cur.destroyed || it->second.tearOff != cur.tearOff
+			|| it->second.takeDmg != cur.takeDmg || it->second.deployed != cur.deployed;
+		if (changed) {
+			Logger::Log("beacon",
+				"WATCH beacon=0x%p uid=%d state=%s hp=%d driCur=%d driMax=%d pct=%.4f "
+				"deployPct=%.3f dmgDuringDeploy=%.1f destroyed=%d tearOff=%d takeDmg=%d deployed=%d\n",
+				b, dri ? dri->r_nUniqueDeployableId : -1,
+				b->GetStateName().GetName() ? b->GetStateName().GetName() : "<null>",
+				cur.hp, cur.driCur, cur.driMax, cur.pct,
+				b->m_fCurrentDeployPercentage, b->m_fDamagedDuringDeploy,
+				cur.destroyed, cur.tearOff, cur.takeDmg, cur.deployed);
+			s_beaconSnaps[Object] = cur;
+		}
+		CallOriginal(Object, edx, Function, Params, Result);
+		break;
+	}
+
+	// Dev/cheat RPC gate. Nothing in our C++ dispatches these functions, so
+	// every arrival is a client console command. PRI bAdmin is the GM flag
+	// (SpawnPlayerCharacter writes 0 for everyone); flagged accounts keep
+	// the full retail cheat/GM console.
+	case DispatchTag::DevCheatRpc: {
+		APlayerReplicationInfo* pri =
+			((APlayerController*)Object)->PlayerReplicationInfo;
+		if (pri && pri->bAdmin) {
+			DoCatchAll();
+		} else if (Logger::IsChannelEnabled("cheatgate")) {
+			std::string fn = Function->GetFullName();
+			std::string obj = Object->GetFullName();
+			Logger::Log("cheatgate", "blocked %s [%s]\n", fn.c_str(), obj.c_str());
+		}
+		break;
+	}
+
+	// RefireCheckTimer's side effect ran above; it has no specific main
+	// handler, so it falls into the catch-all (log + CallOriginal) — same
+	// behavior as the prior else-if chain.
+case DispatchTag::BossBarrierTouch: {
+                struct TouchParams { AActor* Other; UPrimitiveComponent* OtherComp; FVector HitLoc; FVector HitNorm; };
+                TouchParams* p = (TouchParams*)Params;
+                if (p && p->Other && Object) {
+                        AActor* a = (AActor*)Object;
+                        AActor* b = p->Other;
+
+                        ATgPawn* playerPawn = nullptr;
+                        ATgModifyPawnPropertiesVolume* volume = nullptr;
+
+                        // Touch is dispatched on the volume with the toucher as
+                        // Other, but accept either order rather than assume.
+                        if (ObjectClassCache::ClassNameContains(a, "TgModifyPawnPropertiesVolume")) {
+                                volume = (ATgModifyPawnPropertiesVolume*)a;
+                        } else if (ObjectClassCache::ClassNameContains(b, "TgModifyPawnPropertiesVolume")) {
+                                volume = (ATgModifyPawnPropertiesVolume*)b;
+                        }
+
+                        // A player is a TgPawn possessed by a PlayerController.
+                        // The previous check tested the pawn's own class name for
+                        // "Player", which never matches (players are
+                        // TgPawn_Character), so this gate never engaged at all.
+                        AActor* other = ((AActor*)volume == a) ? b : a;
+                        if (other && ObjectClassCache::ClassNameContains(other, "TgPawn")) {
+                                ATgPawn* pw = (ATgPawn*)other;
+                                if (pw->Controller &&
+                                    ObjectClassCache::ClassNameContains(pw->Controller, "PlayerController")) {
+                                        playerPawn = pw;
+                                }
+                        }
+
+                        // DIAG: log all volume touch events to find kill volume class
+                        if (a && b) {
+                            std::string aName = ObjectClassCache::GetClassName(a);
+                            std::string bName = ObjectClassCache::GetClassName(b);
+                            Logger::Log("debug", "[Touch] a=%s b=%s\n", aName.c_str(), bName.c_str());
+                        }
+                        if (volume && volume->m_bOneWayMovement)
+                            MissionClearance::g_bossBarrierPtrs.insert((void*)volume);
+
+                        const bool isBossBarrier = MissionClearance::g_bossBarrierPtrs.count((void*)volume) > 0;
+                        if (playerPawn && isBossBarrier) {
+                            if (!MissionClearance::CanEnterBossChamber(playerPawn)) {
+                                // Calculate outward push direction from barrier surface normal
+                                FVector pushDir = p->HitNorm;
+                                float pushLen = sqrtf(pushDir.X * pushDir.X + pushDir.Y * pushDir.Y + pushDir.Z * pushDir.Z);
+                                if (pushLen > 0.1f) {
+                                    pushDir.X /= pushLen;
+                                    pushDir.Y /= pushLen;
+                                    pushDir.Z /= pushLen;
+                                } else {
+                                    float dx = playerPawn->Location.X - volume->Location.X;
+                                    float dy = playerPawn->Location.Y - volume->Location.Y;
+                                    float dlen = sqrtf(dx * dx + dy * dy);
+                                    if (dlen > 0.1f) {
+                                        pushDir.X = dx / dlen;
+                                        pushDir.Y = dy / dlen;
+                                        pushDir.Z = 0.0f;
+                                    } else {
+                                        pushDir.X = 1.0f;
+                                        pushDir.Y = 0.0f;
+                                        pushDir.Z = 0.0f;
+                                    }
+                                }
+
+                                // Ramp-safe position offset: gentle 35-unit cushion outside boundary.
+                                // Clamp Z so it NEVER pushes downward into the floor, plus a +5.0f safety lift.
+                                playerPawn->Location.X += pushDir.X * 35.0f;
+                                playerPawn->Location.Y += pushDir.Y * 35.0f;
+                                playerPawn->Location.Z += std::max(0.0f, pushDir.Z * 35.0f) + 5.0f;
+
+                                // Stop forward momentum dead (no floating air drift on jetpack release)
+                                playerPawn->Velocity.X = 0.0f;
+                                playerPawn->Velocity.Y = 0.0f;
+                                playerPawn->Velocity.Z = 0.0f;
+
+                                playerPawn->bNetDirty = 1;
+                                playerPawn->bForceNetUpdate = 1;
+
+                                Logger::Log("debug", "[BossBarrier] entry refused - ramp-safe bounce pawn %s\n",
+                                            playerPawn->GetFullName());
+                                return; // Block entry
+                            } else if (!volume->m_bOneWayMovement) {
+                                // Clearance met: unlock barrier, restore one-way exit blocking
+                                volume->m_bOneWayMovement = 1;
+                                volume->bNetDirty = 1;
+                                volume->bForceNetUpdate = 1;
+                            }
+                        }
+                }
+                CallOriginal(Object, edx, Function, Params, Result);
+                break;
+        }
+
+        case DispatchTag::RefireCheckTimer:
+	case DispatchTag::Unknown:
+	default:
+		DoCatchAll();
+		break;
+	}
+
+	if (scopeLog) LogScopeCall("AFTER ", Object, Function);
+}
+
+
+

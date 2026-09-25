@@ -1,0 +1,171 @@
+#include "src/ControlServer/MatchmakingService/Rules/CoopMatchRule.hpp"
+#include "src/ControlServer/MatchmakingService/RuleSupport.hpp"
+#include "src/ControlServer/MatchmakingService/StrictBalance.hpp"
+
+#include <algorithm>
+
+using mm::PartiesByWaitAsc;
+using mm::PackParties;
+using mm::BuildResult;
+
+namespace {
+
+// Split a party list into (teams, solos).
+void Partition(const std::vector<QueuedParty>& parties,
+               std::vector<QueuedParty>& teams,
+               std::vector<QueuedParty>& solos) {
+    for (const auto& p : parties) {
+        if (p.is_team) teams.push_back(p);
+        else           solos.push_back(p);
+    }
+}
+
+}  // namespace
+
+MatchResult CoopMatchRule::BuildOwnMatch(const QueuedParty& team) const {
+    // One party (team, or solo-locked player), its own fresh PARTY_LOCKED
+    // instance. Cap stays the queue cap (left to the orchestrator) so
+    // in-mission invites can still grow it.
+    std::vector<QueuedParty> one{team};
+    auto ordered = PartiesByWaitAsc(one);
+    MatchResult r = BuildResult(
+        ordered, cfg_.taskforce_policy, cfg_.team_side_policy,
+        /*seed1=*/{}, /*seed2=*/{},
+        AccessMode::PartyLocked, /*owners=*/{team.party_id});
+    // map/mode left empty -> filled from pool by the orchestrator.
+    return r;
+}
+
+std::optional<MatchResult> CoopMatchRule::PlacePool(
+    const std::vector<QueuedParty>& parties,
+    const std::vector<RunningInstance>& instances) const {
+
+    if (parties.empty()) return std::nullopt;
+    auto ordered = PartiesByWaitAsc(parties);
+
+    // Strict knobs are inert unless the queue is BalancedPvp.
+    const bool pvp      = cfg_.taskforce_policy == TaskforcePolicy::BalancedPvp;
+    const bool strict   = pvp && cfg_.strict_class_balance;
+    const bool backfill = pvp && cfg_.late_join_policy == LateJoinPolicy::BackfillOnly;
+
+    // 0. Backfill into BACKFILL_ONLY instances (sealed to drop-in; this is
+    //    the only entry path). Class repair first, then the optional
+    //    MMR-gated pair admission.
+    if (backfill) {
+        for (const auto& inst : instances) {
+            if (inst.access_mode != AccessMode::BackfillOnly) continue;
+            auto invites = StrictBalance::PlanDeficitBackfill(parties, inst);
+            if (invites.empty() && cfg_.pair_backfill)
+                invites = StrictBalance::PlanPairJoin(parties, inst);
+            if (invites.empty()) continue;
+
+            MatchResult r;
+            for (const auto& iv : invites) {
+                const auto& m = iv.party->members.front();
+                r.consumed_party_ids.push_back(iv.party->party_id);
+                r.session_guids.push_back(m.session_guid);
+                r.task_force_assignments[m.session_guid] = iv.tf;
+                r.profile_ids[m.session_guid] = m.profile_id;
+                r.mmrs[m.session_guid] = m.mmr;
+            }
+            r.existing_instance_id = inst.instance_id;
+            r.map_name  = inst.map_name;
+            r.game_mode = inst.game_mode;
+            return r;
+        }
+    }
+
+    // 1. Drop-in: first OPEN instance with room for at least one whole party.
+    for (const auto& inst : instances) {
+        if (inst.access_mode != AccessMode::Open) continue;  // never enter locked/sealed
+        const int seats = inst.seats_free();                 // -1 = unlimited
+        auto chosen = PackParties(ordered, seats);
+        if (chosen.empty()) continue;
+
+        MatchResult r = BuildResult(
+            chosen, cfg_.taskforce_policy, cfg_.team_side_policy,
+            inst.team1, inst.team2, AccessMode::Open, /*owners=*/{});
+        r.existing_instance_id = inst.instance_id;
+        r.map_name  = inst.map_name;
+        r.game_mode = inst.game_mode;
+        return r;
+    }
+
+    // 2. Fresh spawn. Cap by the queue's per-instance ceiling; strict mode
+    //    picks the largest all-even-class subset instead of greedy packing.
+    const uint32_t cap = mm::QueueInstanceCap(cfg_);
+    std::vector<const QueuedParty*> chosen;
+    if (strict) {
+        chosen = StrictBalance::SelectClassEqualSubset(parties, cap > 0 ? (int)cap : -1);
+    } else {
+        chosen = PackParties(ordered, cap > 0 ? (int)cap : -1);
+    }
+    if (chosen.empty()) return std::nullopt;
+
+    MatchResult r = BuildResult(
+        chosen, cfg_.taskforce_policy, cfg_.team_side_policy,
+        /*seed1=*/{}, /*seed2=*/{}, AccessMode::Open, /*owners=*/{});
+    if (backfill) {
+        r.access_mode  = AccessMode::BackfillOnly;
+        r.cap_override = (uint32_t)r.session_guids.size();
+    }
+    return r;
+}
+
+std::optional<MatchResult> CoopMatchRule::Evaluate(
+    const std::vector<QueuedParty>& parties,
+    const std::vector<RunningInstance>& instances) {
+
+    if (parties.empty()) return std::nullopt;
+
+    std::vector<QueuedParty> teams, solos;
+    Partition(parties, teams, solos);
+
+    // -togglesolomode: a solo party whose player wants a private match pops
+    // its own fresh PARTY_LOCKED instance (like a team under OwnMatch) and
+    // never enters the drop-in pool. Only where a 1-player spawn is possible
+    // (min_players_to_pop <= 1) — in group queues (merc/ddr/sr) the flag is
+    // inert and the player is matched normally. TryPop recurses after each
+    // pop, so remaining locked solos/teams drain in the same event.
+    if (cfg_.min_players_to_pop <= 1) {
+        std::vector<QueuedParty> locked;
+        solos.erase(std::remove_if(solos.begin(), solos.end(),
+            [&](const QueuedParty& p) {
+                const bool wants = !p.members.empty() && p.members.front().solo_lock;
+                if (wants) locked.push_back(p);
+                return wants;
+            }), solos.end());
+        if (!locked.empty()) {
+            auto ordered = PartiesByWaitAsc(locked);
+            return BuildOwnMatch(*ordered.front());
+        }
+    }
+
+    switch (cfg_.team_policy) {
+        case TeamPolicy::OwnMatch: {
+            // A team always gets its own fresh PARTY_LOCKED match. Pop the
+            // longest-waiting team first; solos handled on a later Evaluate.
+            if (!teams.empty()) {
+                auto ordered = PartiesByWaitAsc(teams);
+                return BuildOwnMatch(*ordered.front());
+            }
+            // Solos only — drop into OPEN instances or fresh-spawn.
+            return PlacePool(solos, instances);
+        }
+        case TeamPolicy::Block:
+            // Teams rejected upstream; defensively ignore any that slipped in.
+            return PlacePool(solos, instances);
+        case TeamPolicy::Mixed: {
+            // teams + solos, NOT `parties` — solo-locked parties were stripped
+            // from `solos` above and must stay out of the shared pool.
+            // PlacePool re-orders by wait time, so concatenation order is fine.
+            std::vector<QueuedParty> pool = teams;
+            pool.insert(pool.end(), solos.begin(), solos.end());
+            return PlacePool(pool, instances);
+        }
+        case TeamPolicy::VersusSides:
+            // Misconfiguration — VersusSides queues should use VersusSidesRule.
+            return std::nullopt;
+    }
+    return std::nullopt;
+}

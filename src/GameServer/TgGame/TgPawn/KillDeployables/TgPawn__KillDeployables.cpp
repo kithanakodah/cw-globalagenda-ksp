@@ -1,0 +1,173 @@
+#include "src/GameServer/TgGame/TgPawn/KillDeployables/TgPawn__KillDeployables.hpp"
+#include "src/Utils/Logger/Logger.hpp"
+#include "src/GameServer/Utils/ObjectClassCache/ObjectClassCache.hpp"
+#include "src/GameServer/TgGame/_deployable_classify/DeployableClassify.hpp"
+
+// Native UTgPawn::execKillDeployables @ 0x109c0870 is a void stub. UC declares
+//     native function KillDeployables(bool bAll);
+// and the exec stub makes UC calls to it no-ops. Callers:
+//     TgPawn.uc:3089  KillDeployables(true)   ← round-end / destroy-all path
+//     TgPawn.uc:4378  KillDeployables(false)  ← regular death: only mark-on-death
+//
+// This replaces the no-op with the logic UC would have had: iterate
+// s_SelfDeployableList, DestroyIt each entry that either (a) the caller asked
+// for blanket destruction via bAll, or (b) has m_bDestroyOnOwnerDeathFlag
+// (from asm_data_set_deployables.destroy_on_owner_death_flag via
+// InitializeFromDeployableDat's cfg+0x58 bit0).
+//
+// Intentionally does NOT call the original (it would be a no-op anyway).
+void __fastcall TgPawn__KillDeployables::Call(ATgPawn* Pawn, void* edx, unsigned long bAll) {
+	if (!Pawn) return;
+
+	const int count = Pawn->s_SelfDeployableList.Count;
+
+	// An AI's death takes its deployables with it. The PlayDying path calls
+	// KillDeployables(false), which normally only reaps deployables flagged
+	// destroy_on_owner_death — that flag-gate exists so a PLAYER's death lets
+	// their turrets/etc. live out their own lifespan (the player respawns and
+	// the deployables get reaped later at pawn Destroyed). AI bosses (e.g.
+	// Elite Techro's Buff Station, deployable 209, flag=0) don't respawn, so
+	// there's no "later" — defer-to-Destroyed left the station standing.
+	// Treat a non-player owner's death as destroy-all so NPC summons die with
+	// the summoner, at the same PlayDying moment their owned bots do (KillOwnedBots).
+	const bool bOwnerIsAI =
+		!ObjectClassCache::ClassNameContains((UObject*)Pawn->Controller, "PlayerController");
+	const bool bDestroyAll = bAll || bOwnerIsAI;
+
+	Logger::Log("debug",
+		"[KillDeployables] pawn=0x%p pawnId=%d bAll=%d listCount=%d\n",
+		Pawn, (int)Pawn->r_nPawnId, (int)bAll, count);
+
+	// Walk in reverse in case the destroy path unlinks entries from the list
+	// (it shouldn't on the server path — DestroyIt sets flags and bumps
+	// r_nReplicateDestroyIt without mutating s_SelfDeployableList — but the
+	// reverse walk is robust either way and matches UE3's foreach semantics
+	// against a destroyed-during-iteration actor).
+	for (int i = count - 1; i >= 0; --i) {
+		ATgDeployable* dep = Pawn->s_SelfDeployableList.Data[i];
+		if (!dep) continue;
+
+		// Beacons (deployable_id 36) are TEAM resources owned by
+		// TgTeamBeaconManager, not personal deployables. Their lifecycle is
+		// driven by CheckBeacon / RegisterBeacon / UnRegisterBeacon and
+		// must NOT be tied to the deployer's pawn lifetime — a player who
+		// throws a beacon and then dies (or is fully destroyed via the
+		// KillAllOwnedPets event that fires bAll=1) should leave the beacon
+		// standing for their team.
+		if (dep->r_nDeployableId == 36) {
+			Logger::Log("debug",
+				"  [KillDeployables] skip beacon [%d] 0x%p (team resource — managed by BeaconManager)\n",
+				i, dep);
+			continue;
+		}
+
+		const bool shouldDestroy = bDestroyAll || dep->m_bDestroyOnOwnerDeathFlag;
+		if (!shouldDestroy) {
+			Logger::Log("debug",
+				"  [KillDeployables] keep [%d] 0x%p deployableId=%d (destroy_on_owner_death=0)\n",
+				i, dep, dep->r_nDeployableId);
+			continue;
+		}
+		if (dep->m_bInDestroyedState) {
+			Logger::Log("debug",
+				"  [KillDeployables] skip [%d] 0x%p deployableId=%d (already destroyed)\n",
+				i, dep, dep->r_nDeployableId);
+			continue;
+		}
+
+		Logger::Log("debug",
+			"  [KillDeployables] DestroyIt [%d] 0x%p deployableId=%d\n",
+			i, dep, dep->r_nDeployableId);
+
+		// UC `Dep.DestroyIt(false)` — runs the full UC DestroyIt event
+		// which: stops fire, sets LifeSpan, hides mesh, swaps to destroyed
+		// mesh, flips m_bInDestroyedState, bumps r_nReplicateDestroyIt to
+		// trigger the client-side repnotify. Routed through DispatchDestroyIt
+		// so subclass overrides (sensor alert cleanup, etc.) run too.
+		DeployableClassify::DispatchDestroyIt(dep, 0 /* bSkipFx */);
+	}
+
+	// UC does `s_SelfDeployableList.Length = 0;` — reset the Count. Data
+	// buffer stays allocated for reuse by future spawns on this pawn. The
+	// destroyed actors themselves will be GC'd after LifeSpan expires.
+	Pawn->s_SelfDeployableList.Count = 0;
+}
+
+// Walk gri->m_Deployables (global, survives pawn respawn) and PawnList (for
+// deployed bot pawns like the Grizzly drone). Called on team-change and
+// profile-switch so deployables placed before a prior death are also caught.
+void TgPawn__KillDeployables::KillAllOwned(ATgPawn* Pawn) {
+	if (!Pawn) return;
+
+	AWorldInfo* wi = Pawn->WorldInfo;
+	if (!wi || !wi->GRI) return;
+	ATgRepInfo_Game* gri = (ATgRepInfo_Game*)wi->GRI;
+	ATgRepInfo_Player* pri = (ATgRepInfo_Player*)Pawn->PlayerReplicationInfo;
+
+	// Destroy ATgDeployables in the global list that belong to this player.
+	Logger::Log("deployables",
+		"[KillAllOwned] pawn=0x%p pri=0x%p gri->m_Deployables.Count=%d\n",
+		Pawn, pri, gri->m_Deployables.Count);
+	for (int i = gri->m_Deployables.Count - 1; i >= 0; --i) {
+		ATgDeployable* dep = gri->m_Deployables.Data[i];
+		if (!dep) continue;
+		Logger::Log("deployables",
+			"[KillAllOwned]   [%d] dep=0x%p id=%d destroyed=%d DRI=0x%p instigator=0x%p\n",
+			i, dep, dep->r_nDeployableId, (int)dep->m_bInDestroyedState,
+			dep->r_DRI, dep->r_DRI ? dep->r_DRI->r_InstigatorInfo : nullptr);
+		if (dep->m_bInDestroyedState) continue;
+		if (dep->r_nDeployableId == 36) continue; // beacon: team resource, survives profile swap
+		if (!dep->r_DRI || dep->r_DRI->r_InstigatorInfo != pri) continue;
+		Logger::Log("deployables",
+			"[KillAllOwned] DestroyIt deployable=0x%p id=%d\n",
+			dep, dep->r_nDeployableId);
+		DeployableClassify::DispatchDestroyIt(dep, 0);
+	}
+
+	// Kill deployed bot pawns (e.g. Grizzly drone).
+	for (APawn* p = wi->PawnList; p != nullptr; p = p->NextPawn) {
+		if (p == (APawn*)Pawn || p->Health <= 0 || p->bDeleteMe) continue;
+		if (ObjectClassCache::ClassNameContains((UObject*)p->Controller, "PlayerController")) continue;
+		Logger::Log("deployables",
+			"[KillAllOwned] bot pawn=0x%p Instigator=0x%p PRI=0x%p\n",
+			p, p->Instigator, p->PlayerReplicationInfo);
+		if (p->Instigator != (APawn*)Pawn) continue;
+		Logger::Log("deployables",
+			"[KillAllOwned] KilledBy bot pawn=0x%p\n", p);
+		p->eventKilledBy((APawn*)Pawn);
+	}
+
+	Pawn->s_SelfDeployableList.Count = 0;
+}
+
+// Swapping a device off the loadout must take its live output with it — a
+// power station left standing after its device is gone has no owner device to
+// govern it. Same teardown as KillAllOwned, scoped to one device.
+void TgPawn__KillDeployables::KillFromDevice(ATgPawn* Pawn, ATgDevice* Device) {
+	if (!Pawn || !Device) return;
+
+	AWorldInfo* wi = Pawn->WorldInfo;
+	if (!wi || !wi->GRI) return;
+	ATgRepInfo_Game* gri = (ATgRepInfo_Game*)wi->GRI;
+	const int invId = Device->r_nDeviceInstanceId;
+
+	for (int i = gri->m_Deployables.Count - 1; i >= 0; --i) {
+		ATgDeployable* dep = gri->m_Deployables.Data[i];
+		if (!dep || dep->m_bInDestroyedState) continue;
+		if (dep->r_nDeployableId == 36) continue; // beacon: team resource
+		// invId also matches deployables placed by an earlier actor for the same
+		// inventory item (device actors are respawned on death / profile switch).
+		if (dep->r_Owner != Device &&
+		    !(dep->r_Owner && dep->r_Owner->r_nDeviceInstanceId == invId)) continue;
+		DeployableClassify::DispatchDestroyIt(dep, 0);
+	}
+
+	// Pet pawns (turrets, drones) carry their spawning device's instance id.
+	for (APawn* p = wi->PawnList; p != nullptr; p = p->NextPawn) {
+		if (p == (APawn*)Pawn || p->Health <= 0 || p->bDeleteMe) continue;
+		ATgPawn* pet = (ATgPawn*)p;
+		if (pet->r_Owner != Pawn) continue;
+		if (pet->s_nSpawnerDeviceInstId != invId) continue;
+		p->eventKilledBy((APawn*)Pawn);
+	}
+}

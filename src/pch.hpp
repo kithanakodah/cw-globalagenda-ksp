@@ -1,0 +1,34 @@
+#ifndef COMMONWEALTH_GA_SERVER_PCH_HPP
+#define COMMONWEALTH_GA_SERVER_PCH_HPP
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
+#include <windows.h>
+// #include <stdio.h>
+// #include <time.h>
+#include <math.h>
+// #include <string>
+// #include <fstream>
+// #include <sstream>
+#include <iomanip>
+// #include <chrono>
+#include <stdarg.h>
+#include <cstdio>
+#include <shellapi.h>
+#include <unordered_set>
+#include <unordered_map>
+#include <vector>
+#include "lib/sqlite3/sqlite3.h"
+#include <unistd.h>
+#define ASIO_DISABLE_IOCP
+#define ASIO_NO_WIN32_LEAN_AND_MEAN
+#include "lib/asio-1.34.2/include/asio.hpp"
+#ifndef __C_ASSERT__
+#define __C_ASSERT__(x) typedef char __C_ASSERT__[(x) ? 1 : -1]
+#endif
+#include "lib/detours/detours.h"
+#include <map>
+#include "src/SDK/SdkHeaders.h"
+
+#endif // COMMONWEALTH_GA_SERVER_PCH_HPP

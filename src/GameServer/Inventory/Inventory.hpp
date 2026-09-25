@@ -1,0 +1,123 @@
+#pragma once
+
+#include "src/pch.hpp"
+#include <vector>
+#include <map>
+#include <unordered_map>
+
+struct EquippedEntry {
+	int deviceId;
+	int slot;          // equip point (1-24)
+	int quality;       // qualityValueId (0 = none)
+	int inventoryId;   // unique ID assigned by Inventory
+	int effectGroupId; // hardcoded effect group ID for inventory marshals
+	// Rolled mod effect_group_ids — the same list passed into Equip()'s
+	// `mods` arg. Stashed here so Unequip() can subtract the exact same
+	// rolled-mod buff entries it added, without a DB roundtrip.
+	std::vector<int> mods;
+};
+
+class Inventory {
+public:
+	// Equip a device on a pawn. Does NOT call UpdateClientDevices.
+	// Call Finalize() after all equips to trigger replication.
+	// Returns ATgDevice* (nullptr on failure).
+	//
+	// `mods` is the list of rolled mod effect_group_ids stored in
+	// ga_character_devices.mod_effect_group_ids — one entry per [letter] in
+	// the item's UI suffix. Each effect_group's effects get applied to the
+	// pawn's s_Properties at equip time so the modifiers actually affect
+	// gameplay (not just the tooltip).
+	static ATgDevice* Equip(ATgPawn* Pawn, int deviceId, int slot, int quality = 0,
+	                        int inventoryId = 0, const std::vector<int>& mods = {});
+
+	// Trigger replication after all equips are done.
+	// Calls UpdateClientDevices + sets bNetDirty/bForceNetUpdate on pawn and PRI.
+	static void Finalize(ATgPawn* Pawn);
+	// Live profile switches use markNetDirty=false: UpdateClientDevices is
+	// needed, but dirtying pawn/PRI afterward previously faulted before repaint IPC.
+	static void Finalize(ATgPawn* Pawn, bool markNetDirty);
+
+	// Query equipped devices for a pawn (for TcpSession inventory marshals).
+	// Returns const ref to the vector (empty vector if pawn not tracked).
+	static const std::vector<EquippedEntry>& GetEquipped(ATgPawn* Pawn);
+
+	// Query equipped devices by pawn ID (for inventory marshals that only have pawnId).
+	// Returns const ref to the vector (empty vector if pawnId not tracked).
+	static const std::vector<EquippedEntry>& GetEquippedByPawnId(int pawnId);
+
+	// O(1) inventory-id → device-id lookup. Returns 0 if `invId` isn't
+	// tracked (e.g. not equipped, or never registered through Equip).
+	// Maintained in lockstep with `s_equipped` by Equip/Unequip/ClearTracking.
+	static int GetDeviceIdByInvId(int invId);
+
+	// Advance and return the next unique inventory ID. Single source of truth.
+	static int NextId();
+
+	// Clear tracking for a pawn (call on pawn death/destroy).
+	static void ClearTracking(ATgPawn* Pawn);
+
+	// Unequip a slot: reverse the rolled-mod buffs, reverse the device's
+	// permanent equip-effect baselines, drop the engine-side replication
+	// (m_EquippedDevices + PRI.r_EquipDeviceInfo), remove the invObj from
+	// the inventory map, and destroy the ATgDevice actor.
+	//
+	// Required because the equip path on this binary is one-way (Equip
+	// always creates a NEW invObj + ATgDevice actor) — without a matching
+	// teardown, switching gear leaks the old device actor (two actors with
+	// the same r_nDeviceInstanceId desync the client's device binding) AND
+	// re-applies effects on top of the existing ones (every Apply press
+	// re-adds the device's lifetime=0 equip baseline; e.g. HUMAN BASE
+	// ATTRIBUTES's +30 physical protection stacks to +60, +90, …).
+	//
+	// Safe to call on an empty slot (no-op).
+	static void Unequip(ATgPawn* Pawn, int slot);
+
+	// Apply the device's permanent (lifetime_sec=0) equip-effect groups to the
+	// pawn's properties. Reimplements what UC `ApplyEquipEffects` would do if
+	// the asm.dat → device->m_EquipEffect setter (a stripped native) were
+	// running. Source for the "30% physical protection by default" baseline:
+	// device 864 ("HUMAN BASE ATTRIBUTES", slot 14) → effect group 3575 →
+	// prop 155 +30 cm=67.
+	//
+	// Called automatically by Equip(); call manually after CreateEquipDevice
+	// in bot-spawn paths that bypass Equip().
+	static void ApplyDeviceEquipEffects(ATgPawn* Pawn, int deviceId);
+
+	// Register the rolled mods carried on a freshly-equipped device with the
+	// pawn's buff registry (m_EffectBuffInfo). Each ApplyBuff entry is
+	// **tagged with the device's instance id** so the binary's `GetBuffIndex`
+	// search-mode treats it as device-scoped: queries from this device match,
+	// queries from other devices skip. Without that, every device's
+	// (propId, 0, 0, 0) entry collides into one shared slot — Output Mod
+	// (prop 385, present on every device) was the discovery case where 9
+	// devices stacked into ~700% fItemPercent.
+	//
+	// `deviceInstanceId` is the device's `r_nDeviceInstanceId`, freshly
+	// assigned by Equip() for player loadouts. Skills bypass this path and
+	// register with devInst=0 (wildcard) so they continue to apply across
+	// every device the pawn carries.
+	static void ApplyRolledModEffects(ATgPawn* Pawn, int deviceId,
+	                                  int deviceInstanceId,
+	                                  const std::vector<int>& effectGroupIds);
+
+private:
+	static int s_nextInventoryId;  // starts at 10000
+	// Keyed by r_nPawnId, NOT the raw pawn pointer: UE3 reuses freed actor
+	// addresses, so a pointer key would collide a freshly-spawned pawn with a
+	// dead pawn's stale entry (wrong mods reversed on unequip / wrong inventory
+	// state). r_nPawnId is a monotonic per-spawn id (TgGame.GetNextPawnId via
+	// UC TgPawn.PostBeginPlay) — unique within an instance, never reused.
+	static std::map<int, std::vector<EquippedEntry>> s_equipped;  // pawnId -> entries
+	static std::unordered_map<int, int> s_deviceByInvId;  // invId -> deviceId (see GetDeviceIdByInvId)
+	static std::vector<EquippedEntry> s_empty;  // returned by GetEquipped when pawn not found
+
+	// Auto-detect device metadata from equip slot
+	static int GetDeviceType(int slot);
+	static bool IsOffHand(int slot);
+	static bool IsHandDevice(int slot);
+
+	// Hardcoded effect group ID lookup by device ID.
+	// Replace with DB lookup when device->effect_group relation is added to the database.
+	static int GetEffectGroupId(int deviceId);
+};

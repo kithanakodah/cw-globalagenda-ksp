@@ -1,0 +1,1280 @@
+#include "src/ControlServer/MatchmakingService/MatchmakingService.hpp"
+#include "src/ControlServer/MatchmakingService/RuleFactory.hpp"
+#include "src/ControlServer/MatchmakingService/SidePlacement.hpp"
+#include "src/ControlServer/Database/Database.hpp"
+#include "src/ControlServer/InstanceRegistry/InstanceRegistry.hpp"
+#include "src/ControlServer/MmrService/MmrService.hpp"
+#include "src/ControlServer/TcpSession/TcpSession.hpp"
+#include "src/ControlServer/Logger.hpp"
+#include "sqlite3.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <limits>
+#include <random>
+
+// ---------------------------------------------------------------------------
+// Static members
+// ---------------------------------------------------------------------------
+
+std::unordered_map<uint32_t, MatchmakingService::Queue> MatchmakingService::queues_;
+std::unordered_map<uint32_t, MapModeSpec> MatchmakingService::forced_maps_;
+MatchmakingService::MatchPopCallback MatchmakingService::on_match_pop_;
+MatchmakingService::InstanceProvider MatchmakingService::instance_provider_;
+std::unordered_map<int64_t, PendingMatch> MatchmakingService::pending_matches_;
+std::unordered_map<int64_t, PendingMatch> MatchmakingService::ready_match_reservations_;
+std::unordered_map<int64_t, std::unordered_map<std::string, int>>
+    MatchmakingService::pre_assigned_teams_;
+asio::io_context* MatchmakingService::io_ctx_ = nullptr;
+
+// ---------------------------------------------------------------------------
+// Init / reload
+// ---------------------------------------------------------------------------
+
+static std::mt19937& MatchRng() {
+    static std::mt19937 eng{std::random_device{}()};
+    return eng;
+}
+
+// Coop (DataDriven) queues join + reserve READY instances; the other rules
+// (DoubleAgent, VersusSides) always spawn fresh, so they never reserve.
+static bool TracksReadyReservations(const QueueConfig& cfg) {
+    return cfg.rule_class.empty()
+        || cfg.rule_class == "DataDriven"
+        || cfg.rule_class == "Coop";
+}
+
+static TaskforcePolicy ParseTaskforcePolicyLogged(const std::string& s, uint32_t qid) {
+    bool ok = true;
+    auto v = mm::ParseTaskforcePolicy(s, &ok);
+    if (!ok) Logger::Log("matchmaking",
+        "[Matchmaking] Queue %u unknown taskforce_policy '%s' — defaulting pinned_1\n", qid, s.c_str());
+    return v;
+}
+static TeamPolicy ParseTeamPolicyLogged(const std::string& s, uint32_t qid) {
+    bool ok = true;
+    auto v = mm::ParseTeamPolicy(s, &ok);
+    if (!ok) Logger::Log("matchmaking",
+        "[Matchmaking] Queue %u unknown team_policy '%s' — defaulting mixed\n", qid, s.c_str());
+    return v;
+}
+static TeamSidePolicy ParseTeamSidePolicyLogged(const std::string& s, uint32_t qid) {
+    bool ok = true;
+    auto v = mm::ParseTeamSidePolicy(s, &ok);
+    if (!ok) Logger::Log("matchmaking",
+        "[Matchmaking] Queue %u unknown team_side_policy '%s' — defaulting ignore\n", qid, s.c_str());
+    return v;
+}
+static PopDelayPolicy ParsePopDelayPolicyLogged(const char* raw, uint32_t qid) {
+    bool ok = true;
+    auto v = mm::ParsePopDelayPolicy(raw ? raw : "", &ok);
+    if (!ok) Logger::Log("matchmaking",
+        "[Matchmaking] Queue %u unknown pop_delay_policy '%s' — defaulting halve_on_join\n",
+        qid, raw ? raw : "");
+    return v;
+}
+static LateJoinPolicy ParseLateJoinPolicyLogged(const char* s, uint32_t queue_id) {
+    bool ok = false;
+    const LateJoinPolicy v = mm::ParseLateJoinPolicy(s ? s : "", &ok);
+    if (!ok) Logger::Log("matchmaking",
+        "[Matchmaking] Queue %u unknown late_join_policy '%s' — using 'open'\n",
+        queue_id, s ? s : "");
+    return v;
+}
+
+static std::vector<QueueConfig> LoadAllQueueConfigsFromDb() {
+    std::vector<QueueConfig> out;
+    sqlite3* db = Database::GetConnection();
+    if (!db) return out;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql =
+        "SELECT queue_id, map_pool_id, name, rule_class, taskforce_policy, continue_in_queue, enabled,"
+        "       queue_type_value_id, status_msg_id, name_msg_id, desc_msg_id, icon_id,"
+        "       max_players_per_side, min_players_per_team, max_players_per_team,"
+        "       level_min, level_max, tab, map_x, map_y, map_active_flag,"
+        "       map_icon_texture_res_id, video_res_id, location_value_id, double_agent_flag,"
+        "       sys_site_id, sort_order, bonus_queue_flag, difficulty_value_id,"
+        "       access_flags, active_flag, locked_flag, remaining_seconds,"
+        "       min_players_to_pop, max_players_per_instance, pop_delay_seconds,"
+        "       pop_delay_policy, instant_pop_when_full,"
+        "       marshal_difficulty_value_id, requires_pvp_verification,"
+        "       team_policy, team_side_policy, max_team_size, map_recency_divisors,"
+        "       strict_class_balance, late_join_policy, pair_backfill, setup_rebalance "
+        "FROM ga_queues ORDER BY sort_order, queue_id";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK || !stmt) {
+        Logger::Log("matchmaking", "[Matchmaking] LoadQueueConfigs prepare failed: %s\n",
+            sqlite3_errmsg(db));
+        return out;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        QueueConfig c;
+        int col = 0;
+        c.queue_id = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.map_pool_id = (sqlite3_column_type(stmt, col) == SQLITE_NULL)
+                        ? 0u : (uint32_t)sqlite3_column_int(stmt, col);
+        col++;
+        if (auto* p = sqlite3_column_text(stmt, col++)) c.name = (const char*)p;
+        if (sqlite3_column_type(stmt, col) != SQLITE_NULL)
+            c.rule_class = (const char*)sqlite3_column_text(stmt, col);
+        col++;
+        c.taskforce_policy = ParseTaskforcePolicyLogged(
+            sqlite3_column_text(stmt, col) ? (const char*)sqlite3_column_text(stmt, col) : "",
+            c.queue_id);
+        col++;
+        c.continue_in_queue = sqlite3_column_int(stmt, col++) != 0;
+        c.enabled           = sqlite3_column_int(stmt, col++) != 0;
+        c.queue_type_value_id     = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.status_msg_id           = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.name_msg_id             = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.desc_msg_id             = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.icon_id                 = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.max_players_per_side    = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.min_players_per_team    = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.max_players_per_team    = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.level_min               = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.level_max               = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.tab                     = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.map_x                   = (float)sqlite3_column_double(stmt, col++);
+        c.map_y                   = (float)sqlite3_column_double(stmt, col++);
+        c.map_active_flag         = sqlite3_column_int(stmt, col++) != 0;
+        c.map_icon_texture_res_id = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.video_res_id            = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.location_value_id       = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.double_agent_flag       = sqlite3_column_int(stmt, col++) != 0;
+        c.sys_site_id             = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.sort_order              = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.bonus_queue_flag        = sqlite3_column_int(stmt, col++) != 0;
+        c.difficulty_value_id     = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.access_flags            = (uint64_t)sqlite3_column_int64(stmt, col++);
+        c.active_flag             = sqlite3_column_int(stmt, col++) != 0;
+        c.locked_flag             = sqlite3_column_int(stmt, col++) != 0;
+        if (sqlite3_column_type(stmt, col) != SQLITE_NULL)
+            c.remaining_seconds = (uint32_t)sqlite3_column_int(stmt, col);
+        col++;
+        c.min_players_to_pop = (uint32_t)sqlite3_column_int(stmt, col++);
+        if (c.min_players_to_pop == 0) {
+            Logger::Log("matchmaking",
+                "[Matchmaking] Queue %u min_players_to_pop=0 invalid — clamping to 1\n", c.queue_id);
+            c.min_players_to_pop = 1;
+        }
+        c.max_players_per_instance = (uint32_t)sqlite3_column_int(stmt, col++);
+        c.pop_delay_seconds        = (float)sqlite3_column_double(stmt, col++);
+        c.pop_delay_policy = ParsePopDelayPolicyLogged(
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, col++)), c.queue_id);
+        c.instant_pop_when_full = sqlite3_column_int(stmt, col++) != 0;
+        if (sqlite3_column_type(stmt, col) != SQLITE_NULL)
+            c.marshal_difficulty_value_id = (uint32_t)sqlite3_column_int(stmt, col);
+        col++;
+        c.requires_pvp_verification = sqlite3_column_int(stmt, col++) != 0;
+        c.team_policy = ParseTeamPolicyLogged(
+            sqlite3_column_text(stmt, col) ? (const char*)sqlite3_column_text(stmt, col) : "mixed",
+            c.queue_id);
+        col++;
+        c.team_side_policy = ParseTeamSidePolicyLogged(
+            sqlite3_column_text(stmt, col) ? (const char*)sqlite3_column_text(stmt, col) : "ignore",
+            c.queue_id);
+        col++;
+        c.max_team_size = (uint32_t)sqlite3_column_int(stmt, col++);
+        if (sqlite3_column_type(stmt, col) != SQLITE_NULL) {
+            const char* raw = (const char*)sqlite3_column_text(stmt, col);
+            bool ok = true;
+            c.map_recency_divisors = mm::ParseRecencyDivisors(raw ? raw : "", &ok);
+            if (!ok) Logger::Log("matchmaking",
+                "[Matchmaking] Queue %u invalid map_recency_divisors '%s' — recency weighting disabled\n",
+                c.queue_id, raw ? raw : "");
+        }
+        col++;
+        c.strict_class_balance = sqlite3_column_int(stmt, col++) != 0;
+        c.late_join_policy = ParseLateJoinPolicyLogged(
+            (const char*)sqlite3_column_text(stmt, col), c.queue_id);
+        col++;
+        c.pair_backfill   = sqlite3_column_int(stmt, col++) != 0;
+        c.setup_rebalance = sqlite3_column_int(stmt, col++) != 0;
+        if ((c.strict_class_balance || c.late_join_policy == LateJoinPolicy::BackfillOnly)
+                && c.taskforce_policy != TaskforcePolicy::BalancedPvp) {
+            Logger::Log("matchmaking",
+                "[Matchmaking] Queue %u strict/backfill knobs set but policy is not balanced_pvp — inert\n",
+                c.queue_id);
+        }
+        out.push_back(std::move(c));
+    }
+    sqlite3_finalize(stmt);
+
+    for (auto& c : out) {
+        if (c.map_pool_id == 0) continue;
+        sqlite3_stmt* ps = nullptr;
+        const char* psql =
+            "SELECT map_name, game_mode, weight, min_players, max_players, dlc_id "
+            "FROM ga_map_pool_entries WHERE map_pool_id = ? AND enabled = 1";
+        if (sqlite3_prepare_v2(db, psql, -1, &ps, nullptr) != SQLITE_OK || !ps) continue;
+        sqlite3_bind_int(ps, 1, (int)c.map_pool_id);
+        while (sqlite3_step(ps) == SQLITE_ROW) {
+            MapModeEntry m;
+            if (auto* p = sqlite3_column_text(ps, 0)) m.map_name  = (const char*)p;
+            if (auto* p = sqlite3_column_text(ps, 1)) m.game_mode = (const char*)p;
+            m.weight = std::max(1, sqlite3_column_int(ps, 2));
+            if (sqlite3_column_type(ps, 3) != SQLITE_NULL) m.min_players = sqlite3_column_int(ps, 3);
+            if (sqlite3_column_type(ps, 4) != SQLITE_NULL) m.max_players = sqlite3_column_int(ps, 4);
+            if (sqlite3_column_type(ps, 5) != SQLITE_NULL) m.dlc_id = sqlite3_column_int64(ps, 5);
+            c.map_pool.push_back(std::move(m));
+        }
+        sqlite3_finalize(ps);
+    }
+    return out;
+}
+
+void MatchmakingService::Init() {
+    queues_.clear();
+    pending_matches_.clear();
+    ready_match_reservations_.clear();
+    pre_assigned_teams_.clear();
+    on_match_pop_ = nullptr;
+    instance_provider_ = nullptr;
+    io_ctx_ = nullptr;
+    Logger::Log("matchmaking", "[Matchmaking] Initialized — loading queue configs from DB\n");
+
+    for (auto& cfg : LoadAllQueueConfigsFromDb()) {
+        const uint32_t qid = cfg.queue_id;
+        queues_[qid] = BuildQueue(std::move(cfg));
+        Logger::Log("matchmaking",
+            "[Matchmaking] Loaded queue %u '%s' (rule=%s team_policy=%d side=%d pool=%zu)\n",
+            qid, queues_[qid].config.name.c_str(),
+            queues_[qid].config.rule_class.empty() ? "Coop" : queues_[qid].config.rule_class.c_str(),
+            (int)queues_[qid].config.team_policy, (int)queues_[qid].config.team_side_policy,
+            queues_[qid].config.map_pool.size());
+    }
+}
+
+void MatchmakingService::ReloadQueues() {
+    auto fresh = LoadAllQueueConfigsFromDb();
+
+    std::unordered_map<uint32_t, std::vector<QueuedParty>> kept_parties;
+    std::unordered_map<uint32_t, std::optional<DelayedPop>> kept_delays;
+    std::unordered_map<uint32_t, std::deque<std::string>>   kept_recent;
+    std::unordered_map<uint32_t, std::unordered_map<std::string, uint32_t>> kept_excl;
+    for (auto& [qid, q] : queues_) {
+        kept_parties[qid] = std::move(q.parties);
+        kept_delays[qid]  = std::move(q.delayed_pop);
+        kept_recent[qid]  = std::move(q.recent_maps);
+        kept_excl[qid]    = std::move(q.exclusion_counts);
+    }
+
+    std::unordered_map<uint32_t, Queue> rebuilt;
+    rebuilt.reserve(fresh.size());
+    for (auto& cfg : fresh) {
+        const uint32_t qid = cfg.queue_id;
+        Queue q = BuildQueue(std::move(cfg));
+        auto pit = kept_parties.find(qid);
+        if (pit != kept_parties.end()) { q.parties = std::move(pit->second); kept_parties.erase(pit); }
+        auto dit = kept_delays.find(qid);
+        if (dit != kept_delays.end()) { q.delayed_pop = std::move(dit->second); kept_delays.erase(dit); }
+        auto rit = kept_recent.find(qid);
+        if (rit != kept_recent.end()) q.recent_maps = std::move(rit->second);
+        auto eit = kept_excl.find(qid);
+        if (eit != kept_excl.end()) q.exclusion_counts = std::move(eit->second);
+        rebuilt[qid] = std::move(q);
+    }
+
+    for (const auto& [qid, parties] : kept_parties) {
+        if (parties.empty()) continue;
+        Logger::Log("matchmaking",
+            "[Matchmaking] ReloadQueues: queue %u removed — dropped %zu queued party(ies)\n",
+            qid, parties.size());
+    }
+    for (auto& [qid, dp] : kept_delays) {
+        if (dp && dp->timer) {
+            dp->timer->cancel();
+            Logger::Log("queue-pop",
+                "[Matchmaking] DelayedPop cancelled queue=%u reason=queue_removed (ReloadQueues)\n", qid);
+        }
+    }
+
+    queues_ = std::move(rebuilt);
+    Logger::Log("matchmaking", "[Matchmaking] ReloadQueues: %zu queue(s) now active\n", queues_.size());
+
+    // Re-evaluate every queue with waiters: a config change (e.g. raised cap)
+    // must take effect without waiting for the next join/leave event.
+    std::vector<uint32_t> qids;
+    for (const auto& [qid, q] : queues_)
+        if (!q.parties.empty() && !q.delayed_pop) qids.push_back(qid);
+    for (uint32_t qid : qids) TryPop(qid);
+}
+
+// ---------------------------------------------------------------------------
+// Queue lifecycle helpers
+// ---------------------------------------------------------------------------
+
+MatchmakingService::Queue MatchmakingService::BuildQueue(QueueConfig cfg) {
+    Queue q;
+    q.config = std::move(cfg);
+    q.rule = RuleFactory::Create(&q.config);
+    return q;
+}
+
+size_t MatchmakingService::QueuedPlayerCount(const Queue& q) {
+    size_t n = 0;
+    for (const auto& p : q.parties) n += p.members.size();
+    return n;
+}
+
+bool MatchmakingService::GetContinueInQueue(uint32_t queue_id) {
+    auto it = queues_.find(queue_id);
+    return it != queues_.end() && it->second.config.continue_in_queue;
+}
+
+std::vector<QueueConfig> MatchmakingService::GetEnabledQueueConfigs() {
+    std::vector<QueueConfig> out;
+    out.reserve(queues_.size());
+    for (const auto& [qid, q] : queues_)
+        if (q.config.enabled) out.push_back(q.config);
+    std::sort(out.begin(), out.end(), [](const QueueConfig& a, const QueueConfig& b) {
+        if (a.sort_order != b.sort_order) return a.sort_order < b.sort_order;
+        return a.queue_id < b.queue_id;
+    });
+    return out;
+}
+
+std::optional<QueueConfig> MatchmakingService::GetQueueConfig(uint32_t queue_id) {
+    auto it = queues_.find(queue_id);
+    if (it == queues_.end()) return std::nullopt;
+    return it->second.config;
+}
+
+uint32_t MatchmakingService::GetQueueInstanceCap(const QueueConfig& cfg, uint32_t instance_max_players) {
+    return mm::QueueInstanceCap(cfg, instance_max_players);
+}
+
+MatchmakingService::QueuedProfileCounts
+MatchmakingService::GetQueuedProfileCounts(uint32_t queue_id) {
+    QueuedProfileCounts counts{0, 0, 0, 0};
+    auto tally = [&](uint32_t profile_id) {
+        switch (profile_id) {
+            case 680: counts.assault++;  break;
+            case 567: counts.medic++;    break;
+            case 681: counts.recon++;    break;
+            case 679: counts.robotics++; break;
+            default: break;
+        }
+    };
+    auto it = queues_.find(queue_id);
+    if (it != queues_.end()) {
+        const auto& cfg = it->second.config;
+        // Queued parties destined for a PARTY_LOCKED (private) match are
+        // excluded — a solo who queues can't be matched with them. That's a
+        // team in an own_match queue, or any party in a versus_sides (1v1)
+        // queue (every such match is private).
+        for (const auto& party : it->second.parties) {
+            const bool destined_private =
+                cfg.team_policy == TeamPolicy::VersusSides
+                || (cfg.team_policy == TeamPolicy::OwnMatch && party.is_team);
+            if (destined_private) continue;
+            for (const auto& m : party.members) tally(m.profile_id);
+        }
+    }
+    // Popped-but-not-yet-registered players: skip PARTY_LOCKED matches.
+    for (const auto& [iid, pm] : pending_matches_) {
+        if (pm.queue_id != queue_id) continue;
+        if (pm.access_mode == AccessMode::PartyLocked) continue;
+        for (const auto& [guid, pid] : pm.profile_ids) tally(pid);
+    }
+    for (const auto& [iid, ready] : ready_match_reservations_) {
+        if (ready.queue_id != queue_id) continue;
+        if (ready.access_mode == AccessMode::PartyLocked) continue;
+        for (const auto& [guid, pid] : ready.profile_ids) tally(pid);
+    }
+    return counts;
+}
+
+std::optional<uint32_t>
+MatchmakingService::GetDelayedPopRemainingSeconds(uint32_t queue_id) {
+    auto it = queues_.find(queue_id);
+    if (it == queues_.end() || !it->second.delayed_pop) return std::nullopt;
+    auto delta = it->second.delayed_pop->fires_at - std::chrono::steady_clock::now();
+    if (delta <= std::chrono::milliseconds(0)) return std::nullopt;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(delta).count();
+    return (uint32_t)((ms + 999) / 1000);
+}
+
+std::optional<MapModeSpec>
+MatchmakingService::PickRandomMapPoolEntryForCount(uint32_t queue_id, int count,
+        const std::vector<std::vector<int64_t>>* installed_sets) {
+    auto it = queues_.find(queue_id);
+    if (it == queues_.end()) {
+        Logger::Log("matchmaking",
+            "[Matchmaking] PickRandomMapPoolEntryForCount: queue %u not registered\n", queue_id);
+        return std::nullopt;
+    }
+    const auto& pool = it->second.config.map_pool;
+    if (pool.empty()) {
+        Logger::Log("matchmaking",
+            "[Matchmaking] PickRandomMapPoolEntryForCount: queue %u has empty map_pool\n", queue_id);
+        return std::nullopt;
+    }
+
+    // DLC narrowing (successor spawns): entries every player owns, else the
+    // entries owned by the most players. All-locked-for-all falls back to the
+    // full pool — no pick can help those players, keep legacy behaviour.
+    std::vector<const MapModeEntry*> base;
+    if (installed_sets && !installed_sets->empty()) {
+        size_t best = 0;
+        std::vector<size_t> owners(pool.size(), 0);
+        for (size_t i = 0; i < pool.size(); ++i) {
+            for (const auto& set : *installed_sets)
+                if (mm::EntryPlayableWith(pool[i], set)) ++owners[i];
+            best = std::max(best, owners[i]);
+        }
+        if (best > 0)
+            for (size_t i = 0; i < pool.size(); ++i)
+                if (owners[i] == best) base.push_back(&pool[i]);
+    }
+    if (base.empty())
+        for (const auto& e : pool) base.push_back(&e);
+
+    auto matches = [count](const MapModeEntry& e) {
+        if (e.min_players && count < *e.min_players) return false;
+        if (e.max_players && count > *e.max_players) return false;
+        return true;
+    };
+    std::vector<const MapModeEntry*> candidates;
+    for (const auto* e : base) if (matches(*e)) candidates.push_back(e);
+
+    bool nearest_fit_used = false;
+    int  best_distance    = 0;
+    if (candidates.empty()) {
+        nearest_fit_used = true;
+        auto window_distance = [count](const MapModeEntry& e) -> int {
+            if (e.min_players && count < *e.min_players) return *e.min_players - count;
+            if (e.max_players && count > *e.max_players) return count - *e.max_players;
+            return 0;
+        };
+        best_distance = std::numeric_limits<int>::max();
+        for (const auto* e : base) {
+            const int d = window_distance(*e);
+            if (d < best_distance) { best_distance = d; candidates.clear(); candidates.push_back(e); }
+            else if (d == best_distance) candidates.push_back(e);
+        }
+    }
+    if (candidates.empty()) return std::nullopt;
+
+    // Recency down-weighting: a map's DB weight is divided by the divisor of
+    // its most recent slot in recent_maps (most recent first). Not in history
+    // (or feature off, divisors empty) → raw weight.
+    auto& recent = it->second.recent_maps;
+    const auto& divisors = it->second.config.map_recency_divisors;
+    auto recency_divisor = [&](const std::string& map_name) -> double {
+        for (size_t i = 0; i < recent.size() && i < divisors.size(); ++i)
+            if (recent[i] == map_name) return divisors[i];
+        return 1.0;
+    };
+    std::vector<double> eff(candidates.size());
+    double total = 0.0;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        eff[i] = (double)candidates[i]->weight / recency_divisor(candidates[i]->map_name);
+        total += eff[i];
+    }
+    std::uniform_real_distribution<double> dist(0.0, total);
+    double roll = dist(MatchRng());
+    const MapModeEntry* picked = candidates.back();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        roll -= eff[i];
+        if (roll < 0.0) { picked = candidates[i]; break; }
+    }
+
+    if (!divisors.empty()) {
+        recent.push_front(picked->map_name);
+        while (recent.size() > divisors.size()) recent.pop_back();
+    }
+
+    std::string eff_str;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s%s=%.3g", i ? " " : "",
+                 candidates[i]->map_name.c_str(), eff[i]);
+        eff_str += buf;
+    }
+    Logger::Log("queue-pop",
+        "[Matchmaking] map_pool %s queue=%u count=%d candidates=%zu/%zu picked=%s eff=[%s]\n",
+        nearest_fit_used ? "nearest" : "filter", queue_id, count,
+        candidates.size(), pool.size(), picked->map_name.c_str(), eff_str.c_str());
+    return MapModeSpec{ picked->map_name, picked->game_mode };
+}
+
+void MatchmakingService::SetMatchPopCallback(MatchPopCallback cb) { on_match_pop_ = std::move(cb); }
+void MatchmakingService::SetInstanceProvider(InstanceProvider provider) { instance_provider_ = std::move(provider); }
+void MatchmakingService::SetIoContext(asio::io_context* io) { io_ctx_ = io; }
+
+// ---------------------------------------------------------------------------
+// Party / player management
+// ---------------------------------------------------------------------------
+
+uint64_t MatchmakingService::SoloPartyId(const std::string& session_guid) {
+    // Top bit set so it never collides with TeamService team ids (small ints).
+    return 0x8000000000000000ull | (uint64_t)(std::hash<std::string>{}(session_guid) & 0x7FFFFFFFu);
+}
+
+void MatchmakingService::AddParty(uint32_t queue_id, const QueuedParty& party) {
+    auto it = queues_.find(queue_id);
+    if (it == queues_.end()) {
+        Logger::Log("matchmaking", "[Matchmaking] AddParty: unknown queue %u\n", queue_id);
+        return;
+    }
+    if (party.members.empty()) return;
+
+    // De-dup: a re-queue of the same party replaces the old entry.
+    auto& parties = it->second.parties;
+    parties.erase(std::remove_if(parties.begin(), parties.end(),
+        [&](const QueuedParty& p) { return p.party_id == party.party_id; }), parties.end());
+    parties.push_back(party);
+
+    // Stamp current ratings for the queued class (design 2026-07-12 MMR
+    // nudge). Folds run at MISSION_ENDED, so re-queuing players are fresh.
+    // Installed DLC packs stamped alongside — drive the DLC-aware pop path.
+    for (auto& m : parties.back().members) {
+        m.mmr = MmrService::GetCurrentRating(m.user_id, m.profile_id);
+        m.installed_dlcs = Database::GetInstalledDlcIds(m.user_id);
+    }
+
+    Logger::Log("matchmaking",
+        "[Matchmaking] Party %llu (%s, %zu member(s)) joined queue %u (%zu player(s) queued)\n",
+        (unsigned long long)party.party_id, party.is_team ? "team" : "solo",
+        party.members.size(), queue_id, QueuedPlayerCount(it->second));
+
+    OnQueueChanged(queue_id, "join", party.leader_guid);
+}
+
+void MatchmakingService::SetSoloLockForQueuedPlayer(const std::string& session_guid,
+                                                    bool solo_lock) {
+    for (auto& [queue_id, q] : queues_) {
+        for (auto& party : q.parties) {
+            if (party.is_team) continue;
+            for (auto& m : party.members) {
+                if (m.session_guid != session_guid) continue;
+                if (m.solo_lock == solo_lock) return;
+                m.solo_lock = solo_lock;
+                Logger::Log("matchmaking",
+                    "[Matchmaking] Player %s solo_lock=%d updated in queue %u\n",
+                    session_guid.c_str(), solo_lock ? 1 : 0, queue_id);
+                // Enabling mid-queue may unlock an own-match pop right away.
+                OnQueueChanged(queue_id, "solo_lock", session_guid);
+                return;
+            }
+        }
+    }
+}
+
+void MatchmakingService::AddPlayer(uint32_t queue_id, const QueuedPlayer& player) {
+    QueuedParty party;
+    party.party_id    = SoloPartyId(player.session_guid);
+    party.is_team     = false;
+    party.leader_guid = player.session_guid;
+    party.joined_at   = player.joined_at;
+    party.members.push_back(player);
+    AddParty(queue_id, party);
+}
+
+// Shared post-mutation handling: instant-pop-when-full, delay re-arm, TryPop.
+void MatchmakingService::OnQueueChanged(uint32_t queue_id, const char* trigger,
+                                        const std::string& who) {
+    auto it = queues_.find(queue_id);
+    if (it == queues_.end()) return;
+    auto& q = it->second;
+    const size_t players = QueuedPlayerCount(q);
+
+    const bool is_join = std::string(trigger) == "join";
+    if (is_join && q.config.instant_pop_when_full
+            && q.config.max_players_per_instance > 0
+            && players >= q.config.max_players_per_instance) {
+        Logger::Log("queue-pop",
+            "[Matchmaking] InstantPop queue=%u (players=%zu >= max=%u)\n",
+            queue_id, players, q.config.max_players_per_instance);
+        if (q.delayed_pop) {
+            if (q.delayed_pop->timer) q.delayed_pop->timer->cancel();
+            q.delayed_pop.reset();
+        }
+        TryPop(queue_id, /*delay_elapsed=*/true);
+        return;
+    }
+
+    if (q.delayed_pop) MaybeResetDelayedPop(q, trigger, who);
+    else               TryPop(queue_id);
+}
+
+bool MatchmakingService::RemoveParty(uint64_t party_id) {
+    for (auto& [queue_id, q] : queues_) {
+        auto& parties = q.parties;
+        auto it = std::find_if(parties.begin(), parties.end(),
+            [&](const QueuedParty& p) { return p.party_id == party_id; });
+        if (it == parties.end()) continue;
+        Logger::Log("matchmaking",
+            "[Matchmaking] Party %llu removed from queue %u\n",
+            (unsigned long long)party_id, queue_id);
+        parties.erase(it);
+        if (q.delayed_pop) MaybeResetDelayedPop(q, "leave", "");
+        return true;
+    }
+    return false;
+}
+
+void MatchmakingService::RemovePlayer(const std::string& session_guid) {
+    // 1. Remove the whole party containing this guid from its queue (atomic).
+    for (auto& [queue_id, q] : queues_) {
+        auto& parties = q.parties;
+        auto it = std::find_if(parties.begin(), parties.end(),
+            [&](const QueuedParty& p) {
+                for (const auto& m : p.members)
+                    if (m.session_guid == session_guid) return true;
+                return false;
+            });
+        if (it != parties.end()) {
+            Logger::Log("matchmaking",
+                "[Matchmaking] Player %s removed from queue %u (party %llu, %zu member(s))\n",
+                session_guid.c_str(), queue_id, (unsigned long long)it->party_id,
+                it->members.size());
+            parties.erase(it);
+            if (q.delayed_pop) MaybeResetDelayedPop(q, "leave", session_guid);
+            break;
+        }
+    }
+
+    // 2. Scrub the guid (individually) from any pending match.
+    for (auto& [iid, pm] : pending_matches_) {
+        auto sit = std::find(pm.session_guids.begin(), pm.session_guids.end(), session_guid);
+        if (sit == pm.session_guids.end()) continue;
+        pm.session_guids.erase(sit);
+        pm.task_force_assignments.erase(session_guid);
+        pm.profile_ids.erase(session_guid);
+        Logger::Log("matchmaking",
+            "[Matchmaking] Player %s removed from pending match for instance %lld (%zu left)\n",
+            session_guid.c_str(), (long long)iid, pm.session_guids.size());
+        break;
+    }
+
+    // 3. Ready reservations.
+    RemoveReadyMatchReservation(session_guid, "player removed from matchmaking");
+}
+
+// ---------------------------------------------------------------------------
+// Pending / ready reservation bookkeeping
+// ---------------------------------------------------------------------------
+
+void MatchmakingService::AddPendingMatch(int64_t instance_id, PendingMatch match) {
+    Logger::Log("matchmaking",
+        "[Matchmaking] Pending match added for instance %lld (%zu players, access=%s)\n",
+        (long long)instance_id, match.session_guids.size(), mm::AccessModeToString(match.access_mode));
+    pending_matches_[instance_id] = std::move(match);
+}
+
+std::optional<PendingMatch> MatchmakingService::ConsumePendingMatch(int64_t instance_id) {
+    auto it = pending_matches_.find(instance_id);
+    if (it == pending_matches_.end()) return std::nullopt;
+    PendingMatch match = std::move(it->second);
+    pending_matches_.erase(it);
+    return match;
+}
+
+void MatchmakingService::TrackReadyMatchReservations(
+    int64_t instance_id, uint32_t queue_id, const std::string& game_mode,
+    const std::vector<std::string>& session_guids,
+    const std::unordered_map<std::string, int>& task_force_assignments,
+    const std::unordered_map<std::string, uint32_t>& profile_ids,
+    const std::unordered_map<std::string, double>& mmrs, uint32_t cap) {
+    if (instance_id == 0 || session_guids.empty()) return;
+    auto qit = queues_.find(queue_id);
+    if (qit == queues_.end() || !TracksReadyReservations(qit->second.config)) return;
+
+    auto& ready = ready_match_reservations_[instance_id];
+    if (ready.instance_id == 0) {
+        ready.instance_id = instance_id;
+        ready.queue_id = queue_id;
+        ready.game_mode = game_mode;
+        ready.cap = cap;
+        // Carry access from the instance row so GetQueuedProfileCounts can skip
+        // PARTY_LOCKED (private) reservations in the per-class card.
+        if (auto inst = InstanceRegistry::GetInstanceById(instance_id))
+            ready.access_mode = mm::ParseAccessMode(inst->access_mode);
+    }
+    if (ready.cap == 0 && cap != 0) ready.cap = cap;
+
+    size_t added = 0;
+    for (const auto& guid : session_guids) {
+        if (std::find(ready.session_guids.begin(), ready.session_guids.end(), guid)
+                != ready.session_guids.end()) continue;
+        ready.session_guids.push_back(guid);
+        auto tfit = task_force_assignments.find(guid);
+        ready.task_force_assignments[guid] = (tfit != task_force_assignments.end()) ? tfit->second : 1;
+        auto pfit = profile_ids.find(guid);
+        ready.profile_ids[guid] = (pfit != profile_ids.end()) ? pfit->second : 0;
+        auto mit = mmrs.find(guid);
+        ready.mmrs[guid] = (mit != mmrs.end()) ? mit->second : 1000.0;
+        added++;
+    }
+    if (added > 0)
+        Logger::Log("matchmaking",
+            "[Matchmaking] Ready reservations: instance=%lld queue=%u added=%zu total=%zu cap=%u\n",
+            (long long)instance_id, queue_id, added, ready.session_guids.size(), ready.cap);
+}
+
+std::vector<RunningInstance> MatchmakingService::GetReservedReadyInstances(uint32_t queue_id) {
+    std::vector<RunningInstance> out;
+    auto qit = queues_.find(queue_id);
+    if (qit == queues_.end() || !TracksReadyReservations(qit->second.config)) return out;
+
+    std::vector<int64_t> stale;
+    for (const auto& [iid, ready] : ready_match_reservations_) {
+        if (ready.queue_id != queue_id || ready.session_guids.empty()) continue;
+        auto inst = InstanceRegistry::GetInstanceById(iid);
+        if (!inst || inst->state != "READY" || inst->is_home_map || inst->end_mission_at != 0) {
+            stale.push_back(iid);
+            continue;
+        }
+        RunningInstance ri;
+        ri.instance_id  = inst->instance_id;
+        ri.map_name     = inst->map_name;
+        ri.game_mode    = inst->game_mode;
+        ri.queue_id     = inst->queue_id;
+        // Carry the instance's access so a not-yet-populated PARTY_LOCKED /
+        // SEALED reserved instance is never presented to the provider as OPEN.
+        ri.access_mode  = mm::ParseAccessMode(inst->access_mode);
+        {
+            const std::string& csv = inst->owner_party_ids;
+            size_t i = 0;
+            while (i < csv.size()) {
+                size_t j = csv.find(',', i);
+                if (j == std::string::npos) j = csv.size();
+                if (j > i) ri.owner_party_ids.push_back(strtoull(csv.substr(i, j - i).c_str(), nullptr, 10));
+                i = j + 1;
+            }
+        }
+        // Reserved contribution ONLY — the provider adds the live roster.
+        // MMR seeds only for BalancedPvp (neutral elsewhere, see design).
+        const auto qcfg = GetQueueConfig(ready.queue_id);
+        const bool mmr_aware =
+            qcfg && qcfg->taskforce_policy == TaskforcePolicy::BalancedPvp;
+        for (const auto& [guid, tf] : ready.task_force_assignments) {
+            uint32_t profile_id = 0;
+            auto pit = ready.profile_ids.find(guid);
+            if (pit != ready.profile_ids.end()) profile_id = pit->second;
+            TeamSeed& seed = (tf == 2) ? ri.team2 : ri.team1;
+            seed.size += 1;
+            seed.heal_score += SidePlacement::HealValue(profile_id, tf == 2 ? 2 : 1);
+            seed.class_counts[profile_id] += 1;
+            if (mmr_aware) {
+                auto mit = ready.mmrs.find(guid);
+                seed.mmr_sum += (mit != ready.mmrs.end()) ? mit->second : 1000.0;
+            }
+        }
+        ri.player_count = (int)ready.session_guids.size();
+        out.push_back(std::move(ri));
+    }
+    for (int64_t iid : stale) DropReadyMatchReservations(iid);
+    return out;
+}
+
+void MatchmakingService::RemoveReadyMatchReservation(
+    int64_t instance_id, const std::string& session_guid, const char* reason) {
+    auto it = ready_match_reservations_.find(instance_id);
+    if (it == ready_match_reservations_.end()) return;
+    auto& ready = it->second;
+    auto sit = std::find(ready.session_guids.begin(), ready.session_guids.end(), session_guid);
+    if (sit == ready.session_guids.end()) return;
+    ready.session_guids.erase(sit);
+    ready.task_force_assignments.erase(session_guid);
+    ready.profile_ids.erase(session_guid);
+    Logger::Log("matchmaking",
+        "[Matchmaking] Ready reservation removed: instance=%lld guid=%s remaining=%zu reason=%s\n",
+        (long long)instance_id, session_guid.c_str(), ready.session_guids.size(),
+        reason ? reason : "unspecified");
+    if (ready.session_guids.empty()) ready_match_reservations_.erase(it);
+}
+
+void MatchmakingService::RemoveReadyMatchReservation(
+    const std::string& session_guid, const char* reason) {
+    for (auto it = ready_match_reservations_.begin(); it != ready_match_reservations_.end(); ++it) {
+        auto sit = std::find(it->second.session_guids.begin(),
+            it->second.session_guids.end(), session_guid);
+        if (sit == it->second.session_guids.end()) continue;
+        RemoveReadyMatchReservation(it->first, session_guid, reason);
+        return;
+    }
+}
+
+void MatchmakingService::DropReadyMatchReservations(int64_t instance_id) {
+    auto it = ready_match_reservations_.find(instance_id);
+    if (it == ready_match_reservations_.end()) return;
+    size_t n = it->second.session_guids.size();
+    ready_match_reservations_.erase(it);
+    if (n > 0)
+        Logger::Log("matchmaking",
+            "[Matchmaking] Ready reservations dropped: instance=%lld n=%zu\n", (long long)instance_id, n);
+}
+
+void MatchmakingService::SetPreAssignedTeam(int64_t instance_id, const std::string& guid, int tf) {
+    pre_assigned_teams_[instance_id][guid] = tf;
+    Logger::Log("matchmaking",
+        "[Matchmaking] PreAssignedTeam set: instance=%lld guid=%s tf=%d\n",
+        (long long)instance_id, guid.c_str(), tf);
+}
+
+std::optional<int>
+MatchmakingService::ConsumePreAssignedTeam(int64_t instance_id, const std::string& guid) {
+    auto it_inst = pre_assigned_teams_.find(instance_id);
+    if (it_inst == pre_assigned_teams_.end()) return std::nullopt;
+    auto it_guid = it_inst->second.find(guid);
+    if (it_guid == it_inst->second.end()) return std::nullopt;
+    int tf = it_guid->second;
+    it_inst->second.erase(it_guid);
+    if (it_inst->second.empty()) pre_assigned_teams_.erase(it_inst);
+    Logger::Log("matchmaking",
+        "[Matchmaking] PreAssignedTeam consumed: instance=%lld guid=%s tf=%d\n",
+        (long long)instance_id, guid.c_str(), tf);
+    return tf;
+}
+
+void MatchmakingService::DropPreAssignedTeams(int64_t instance_id) {
+    auto it = pre_assigned_teams_.find(instance_id);
+    if (it == pre_assigned_teams_.end()) return;
+    size_t n = it->second.size();
+    pre_assigned_teams_.erase(it);
+    if (n > 0)
+        Logger::Log("matchmaking",
+            "[Matchmaking] PreAssignedTeams dropped: instance=%lld n=%zu\n", (long long)instance_id, n);
+}
+
+void MatchmakingService::DiscardPendingMatchForDeadInstance(int64_t instance_id, const char* reason) {
+    auto it = pending_matches_.find(instance_id);
+    if (it == pending_matches_.end()) return;
+    Logger::Log("matchmaking",
+        "[Matchmaking] Discarding pending match for dead instance %lld (%zu player(s), reason: %s)\n",
+        (long long)instance_id, it->second.session_guids.size(), reason ? reason : "unspecified");
+    for (const auto& guid : it->second.session_guids)
+        TcpSession::DeliverMatchCancelled(guid, reason);
+    pending_matches_.erase(it);
+}
+
+static bool IsInstanceActive(int64_t instance_id) {
+    auto info = InstanceRegistry::GetInstanceById(instance_id);
+    return info && info->state != "STOPPED";
+}
+
+// ---------------------------------------------------------------------------
+// Core logic
+// ---------------------------------------------------------------------------
+
+void MatchmakingService::MaybeResetDelayedPop(Queue& q, const char* trigger, const std::string& guid) {
+    if (!q.delayed_pop) return;
+    const size_t players = QueuedPlayerCount(q);
+
+    if (players < q.config.min_players_to_pop) {
+        if (q.delayed_pop->timer) q.delayed_pop->timer->cancel();
+        Logger::Log("queue-pop",
+            "[Matchmaking] DelayedPop cancelled queue=%u reason=below_min (players=%zu < min=%u) trigger=%s\n",
+            q.config.queue_id, players, q.config.min_players_to_pop, trigger);
+        q.delayed_pop.reset();
+        return;
+    }
+
+    const float prev = q.delayed_pop->next_duration;
+    float next = prev;
+    const bool is_join = std::string(trigger) == "join";
+    switch (q.config.pop_delay_policy) {
+        case PopDelayPolicy::HalveOnJoin:
+            if (!is_join) return;
+            next = std::max(0.5f, prev * 0.5f);
+            break;
+        case PopDelayPolicy::Fixed:
+            return;
+        case PopDelayPolicy::ResetOnJoin:
+            if (!is_join) return;
+            next = q.config.pop_delay_seconds;
+            break;
+    }
+    q.delayed_pop->next_duration = next;
+    const auto next_ms = std::chrono::milliseconds((int64_t)(next * 1000.0f));
+    q.delayed_pop->timer->expires_after(next_ms);
+    q.delayed_pop->fires_at = std::chrono::steady_clock::now() + next_ms;
+
+    const uint32_t qid = q.config.queue_id;
+    auto timer = q.delayed_pop->timer;
+    q.delayed_pop->timer->async_wait([qid, timer](const asio::error_code& ec) {
+        if (ec) return;
+        auto it = queues_.find(qid);
+        if (it == queues_.end()) return;
+        if (!it->second.delayed_pop || it->second.delayed_pop->timer != timer) return;
+        it->second.delayed_pop.reset();
+        Logger::Log("queue-pop", "[Matchmaking] DelayedPop fired queue=%u — proceeding to spawn\n", qid);
+        TryPop(qid, /*delay_elapsed=*/true);
+    });
+    Logger::Log("queue-pop",
+        "[Matchmaking] DelayedPop reset queue=%u prev=%.2fs new=%.2fs players=%zu trigger=%s\n",
+        q.config.queue_id, prev, next, players, trigger);
+}
+
+// Remove the consumed parties (by id) from a queue.
+static void RemoveConsumedParties(std::vector<QueuedParty>& parties,
+                                  const std::vector<uint64_t>& consumed) {
+    parties.erase(std::remove_if(parties.begin(), parties.end(),
+        [&](const QueuedParty& p) {
+            return std::find(consumed.begin(), consumed.end(), p.party_id) != consumed.end();
+        }), parties.end());
+}
+
+void MatchmakingService::EvaluateQueue(uint32_t queue_id) {
+    TryPop(queue_id, /*delay_elapsed=*/false);
+}
+
+void MatchmakingService::TryPop(uint32_t queue_id, bool delay_elapsed) {
+    auto it = queues_.find(queue_id);
+    if (it == queues_.end()) return;
+    auto& queue = it->second;
+    if (!queue.rule || queue.parties.empty()) return;
+
+    // Eligibility: pvp-verification gate. A party is withheld (kept queued, kept
+    // on the card) unless EVERY member is verified for queues that require it.
+    std::vector<QueuedParty> eligible;
+    eligible.reserve(queue.parties.size());
+    for (const auto& party : queue.parties) {
+        if (queue.config.requires_pvp_verification) {
+            bool all_verified = true;
+            for (const auto& m : party.members)
+                if (!Database::IsUserVerifiedForPvp(m.user_id)) { all_verified = false; break; }
+            if (!all_verified) continue;
+        }
+        eligible.push_back(party);
+        for (auto& m : eligible.back().members) {
+            auto xit = queue.exclusion_counts.find(m.session_guid);
+            m.exclusion_count = (xit != queue.exclusion_counts.end()) ? xit->second : 0;
+        }
+    }
+    if (eligible.empty()) return;
+
+    std::vector<RunningInstance> instances;
+    if (instance_provider_) instances = instance_provider_(queue_id);
+
+    // DLC-aware pop (pools with dlc_id-locked entries only; every other queue
+    // takes the single-Evaluate fast path below, unchanged). A player must
+    // never be routed to a map they don't own, so the map is fixed BEFORE the
+    // rule runs and the rule only ever sees the parties that own it. Parties
+    // owning no viable map are simply left queued.
+    const bool dlc_pool = mm::PoolHasDlcMaps(queue.config);
+    std::optional<MatchResult> result;
+    const MapModeEntry* dlc_map = nullptr;  // fresh-spawn map chosen by the DLC path
+
+    if (!dlc_pool) {
+        result = queue.rule->Evaluate(eligible, instances);
+    } else {
+        // 1) Drop-in: offer each instance (provider order, as the rules scan
+        //    it) to the parties owning its map; commit only when the rule
+        //    itself chose that drop-in. Fresh-spawn results are re-derived in
+        //    step 2, so discarding them here never loses a pop.
+        for (const auto& inst : instances) {
+            std::vector<QueuedParty> slice;
+            for (const auto& p : eligible)
+                if (mm::PartyCanPlayMap(queue.config, p, inst.map_name)) slice.push_back(p);
+            if (slice.empty()) continue;
+            auto r = queue.rule->Evaluate(slice, {inst});
+            if (r && r->existing_instance_id) { result = std::move(r); break; }
+        }
+
+        // 2) Fresh spawn: rank maps by ownership — everyone-owns first, then
+        //    by how many queued players own them — with weight/recency order
+        //    inside a rank. First map whose pop passes the gates wins; the
+        //    per-map count windows keep their usual nearest-fit fallback,
+        //    restricted to owned maps.
+        if (!result) {
+            auto& recent = queue.recent_maps;
+            const auto& divisors = queue.config.map_recency_divisors;
+            auto recency_divisor = [&](const std::string& map_name) -> double {
+                for (size_t i = 0; i < recent.size() && i < divisors.size(); ++i)
+                    if (recent[i] == map_name) return divisors[i];
+                return 1.0;
+            };
+
+            struct DlcCand {
+                const MapModeEntry* e = nullptr;
+                std::vector<QueuedParty> slice;   // parties owning this map
+                size_t players = 0;               // headcount across slice
+                double eff = 0.0;                 // weight / recency divisor
+            };
+            std::vector<DlcCand> cands;
+            for (const auto& e : queue.config.map_pool) {
+                DlcCand c; c.e = &e;
+                for (const auto& p : eligible) {
+                    if (!mm::EntryPlayableByParty(e, p)) continue;
+                    c.players += p.size();
+                    c.slice.push_back(p);
+                }
+                if (c.slice.empty()) continue;
+                c.eff = (double)e.weight / recency_divisor(e.map_name);
+                cands.push_back(std::move(c));
+            }
+
+            // Ownership rank first (stable), then weighted-random order inside
+            // each equal-ownership group (sampling without replacement, so the
+            // group's first entry follows the same distribution as the old
+            // single weighted roll).
+            std::stable_sort(cands.begin(), cands.end(),
+                [](const DlcCand& a, const DlcCand& b) { return a.players > b.players; });
+            for (size_t lo = 0; lo < cands.size();) {
+                size_t hi = lo + 1;
+                while (hi < cands.size() && cands[hi].players == cands[lo].players) ++hi;
+                for (size_t i = lo; i + 1 < hi; ++i) {
+                    double total = 0.0;
+                    for (size_t k = i; k < hi; ++k) total += cands[k].eff;
+                    std::uniform_real_distribution<double> dist(0.0, total);
+                    double roll = dist(MatchRng());
+                    size_t pick = hi - 1;
+                    for (size_t k = i; k < hi; ++k) {
+                        roll -= cands[k].eff;
+                        if (roll < 0.0) { pick = k; break; }
+                    }
+                    std::swap(cands[i], cands[pick]);
+                }
+                lo = hi;
+            }
+
+            const MapModeEntry* nf_entry = nullptr;   // nearest-fit fallback
+            std::optional<MatchResult> nf_result;
+            int nf_dist = std::numeric_limits<int>::max();
+            for (auto& c : cands) {
+                auto r = queue.rule->Evaluate(c.slice, {});
+                if (!r || r->existing_instance_id) continue;
+                const int n = (int)r->session_guids.size();
+                // Queue-level min is a hard gate per map: players who don't
+                // own the map don't count toward its pop.
+                if (n < (int)queue.config.min_players_to_pop) continue;
+                int dist = 0;
+                if (c.e->min_players && n < *c.e->min_players)      dist = *c.e->min_players - n;
+                else if (c.e->max_players && n > *c.e->max_players) dist = n - *c.e->max_players;
+                if (dist == 0) { dlc_map = c.e; result = std::move(r); break; }
+                if (dist < nf_dist) { nf_dist = dist; nf_entry = c.e; nf_result = std::move(r); }
+            }
+            if (!result && nf_entry) { dlc_map = nf_entry; result = std::move(nf_result); }
+
+            if (result) {
+                Logger::Log("queue-pop",
+                    "[Matchmaking] dlc map_pool queue=%u picked=%s players=%zu/%zu candidates=%zu%s\n",
+                    queue_id, dlc_map->map_name.c_str(),
+                    result->session_guids.size(), QueuedPlayerCount(queue),
+                    cands.size(), dlc_map == nf_entry ? " (nearest)" : "");
+            }
+        }
+    }
+    if (!result) return;
+
+    // Min-players gate (spawn-new only).
+    if (!result->existing_instance_id
+            && result->session_guids.size() < queue.config.min_players_to_pop) {
+        Logger::Log("queue-pop",
+            "[Matchmaking] TryPop queue=%u below min_players_to_pop (have=%zu need=%u)\n",
+            queue_id, result->session_guids.size(), queue.config.min_players_to_pop);
+        return;
+    }
+
+    // Pop-delay gate (spawn-new only). PARTY_LOCKED spawns skip it: the delay
+    // exists to accumulate players for count-based mission scaling, and a
+    // locked instance is closed to everyone but its owners — waiting can't
+    // grow it (solo-mode and team own-match pops). SEALED (DA) keeps the
+    // delay: its pool does grow until the pop.
+    if (!delay_elapsed && !result->existing_instance_id
+            && result->access_mode != AccessMode::PartyLocked
+            && queue.config.pop_delay_seconds > 0.0f && io_ctx_) {
+        if (queue.delayed_pop) return;  // timer already armed — let it fire
+        const auto now = std::chrono::steady_clock::now();
+        const auto dur_ms = std::chrono::milliseconds((int64_t)(queue.config.pop_delay_seconds * 1000.0f));
+        DelayedPop dp;
+        dp.next_duration = queue.config.pop_delay_seconds;
+        dp.timer = std::make_shared<asio::steady_timer>(*io_ctx_);
+        dp.timer->expires_after(dur_ms);
+        dp.fires_at = now + dur_ms;
+        const uint32_t qid = queue_id;
+        auto timer = dp.timer;
+        dp.timer->async_wait([qid, timer](const asio::error_code& ec) {
+            if (ec) return;
+            auto qit = queues_.find(qid);
+            if (qit == queues_.end()) return;
+            if (!qit->second.delayed_pop || qit->second.delayed_pop->timer != timer) return;
+            qit->second.delayed_pop.reset();
+            Logger::Log("queue-pop", "[Matchmaking] DelayedPop fired queue=%u — proceeding to spawn\n", qid);
+            TryPop(qid, /*delay_elapsed=*/true);
+        });
+        Logger::Log("queue-pop",
+            "[Matchmaking] DelayedPop started queue=%u duration=%.2fs players=%zu\n",
+            queue_id, queue.config.pop_delay_seconds, QueuedPlayerCount(queue));
+        queue.delayed_pop = std::move(dp);
+        return;
+    }
+
+    // Fill map from pool for fresh spawns that left it empty. The DLC path
+    // fixed its map before Evaluate; commit it (and its recency slot) here —
+    // after the delay gate, so an armed timer leaves no recency side effect.
+    if (!result->existing_instance_id && result->map_name.empty()) {
+        if (dlc_pool) {
+            if (!dlc_map) return;  // defensive: DLC fresh results always carry one
+            result->map_name  = dlc_map->map_name;
+            result->game_mode = dlc_map->game_mode;
+            if (!queue.config.map_recency_divisors.empty()) {
+                queue.recent_maps.push_front(dlc_map->map_name);
+                while (queue.recent_maps.size() > queue.config.map_recency_divisors.size())
+                    queue.recent_maps.pop_back();
+            }
+        } else {
+            auto picked = PickRandomMapPoolEntryForCount(queue_id, (int)result->session_guids.size());
+            if (!picked) {
+                Logger::Log("matchmaking",
+                    "[Matchmaking] Queue %u rule wants spawn but map_pool empty — skipping pop\n", queue_id);
+                return;
+            }
+            result->map_name  = picked->map_name;
+            result->game_mode = picked->game_mode;
+        }
+    }
+
+    // Coalesce a fresh OPEN result into an existing OPEN pending (cold-start
+    // race avoidance). PARTY_LOCKED / SEALED results never coalesce — they
+    // each own a private instance. Parties stay atomic: coalesce only when the
+    // WHOLE result fits under the pending's cap.
+    if (!result->existing_instance_id && result->access_mode == AccessMode::Open) {
+        for (auto& [iid, pm] : pending_matches_) {
+            if (pm.queue_id != queue_id) continue;
+            if (pm.access_mode != AccessMode::Open) continue;
+            if (!IsInstanceActive(iid)) continue;
+            const size_t need = result->session_guids.size();
+            if (pm.cap > 0 && pm.session_guids.size() + need > pm.cap) continue;  // try next pending
+            // DLC pools: never coalesce a party onto a pending map it doesn't
+            // own (the result may have been built for a different map).
+            if (dlc_pool) {
+                bool all_own = true;
+                for (const auto& p : eligible) {
+                    if (std::find(result->consumed_party_ids.begin(),
+                                  result->consumed_party_ids.end(),
+                                  p.party_id) == result->consumed_party_ids.end()) continue;
+                    if (!mm::PartyCanPlayMap(queue.config, p, pm.map_name)) { all_own = false; break; }
+                }
+                if (!all_own) continue;
+            }
+
+            for (const auto& guid : result->session_guids) {
+                if (pm.task_force_assignments.count(guid)) continue;  // defensive
+                auto tfit = result->task_force_assignments.find(guid);
+                pm.session_guids.push_back(guid);
+                pm.task_force_assignments[guid] =
+                    (tfit != result->task_force_assignments.end()) ? tfit->second : 1;
+                auto pfit = result->profile_ids.find(guid);
+                pm.profile_ids[guid] = (pfit != result->profile_ids.end()) ? pfit->second : 0;
+                auto mit = result->mmrs.find(guid);
+                pm.mmrs[guid] = (mit != result->mmrs.end()) ? mit->second : 1000.0;
+            }
+            RemoveConsumedParties(queue.parties, result->consumed_party_ids);
+            // Exclusion-priority bookkeeping: entering a match clears a player's
+            // count; a fresh strict pop bumps everyone left behind.
+            for (const auto& guid : result->session_guids)
+                queue.exclusion_counts.erase(guid);
+            if (queue.config.strict_class_balance && !result->existing_instance_id) {
+                for (const auto& party : queue.parties)
+                    for (const auto& m : party.members)
+                        queue.exclusion_counts[m.session_guid] += 1;
+            }
+            Logger::Log("matchmaking",
+                "[Matchmaking] Queue %u: coalesced %zu player(s) into pending instance %lld (total %zu)\n",
+                queue_id, need, (long long)iid, pm.session_guids.size());
+            if (!queue.parties.empty()) TryPop(queue_id, delay_elapsed);
+            return;
+        }
+    }
+
+    // Commit: remove consumed parties, hand the result to the spawn/route callback.
+    RemoveConsumedParties(queue.parties, result->consumed_party_ids);
+    // Exclusion-priority bookkeeping: entering a match clears a player's
+    // count; a fresh strict pop bumps everyone left behind.
+    for (const auto& guid : result->session_guids)
+        queue.exclusion_counts.erase(guid);
+    if (queue.config.strict_class_balance && !result->existing_instance_id) {
+        for (const auto& party : queue.parties)
+            for (const auto& m : party.members)
+                queue.exclusion_counts[m.session_guid] += 1;
+    }
+
+    Logger::Log("matchmaking",
+        "[Matchmaking] Queue %u popped: %zu players map=%s mode=%s access=%s\n",
+        queue_id, result->session_guids.size(), result->map_name.c_str(),
+        result->game_mode.c_str(), mm::AccessModeToString(result->access_mode));
+
+    if (on_match_pop_) on_match_pop_(queue_id, std::move(*result));
+    if (!queue.parties.empty()) TryPop(queue_id, delay_elapsed);
+}
+
+// ---------------------------------------------------------------------------
+// ForceNextMapByNumberAndDifficulty (2026-09-11)
+//
+// Called by the -mission <difficulty> <number> chat command. Sets a one-shot
+// map override on every enabled queue that (a) matches the requested
+// difficulty_value_id and (b) includes the requested map in its pool.
+// The forced map is consumed the next time PickRandomMapPoolEntryForCount is
+// called for that queue and then cleared so normal rotation resumes.
+//
+// Map numbers 1-24 match the Completions page ordering.
+// ---------------------------------------------------------------------------
+static const char* kMissionMapNames[] = {
+    nullptr,              // index 0 unused
+    "1P_CPFactory01_P",   // 1
+    "1P_CPFactory02_P",   // 2
+    "1P_CPFactory03_P",   // 3
+    "1P_CPFactory04_P",   // 4
+    "1P_CPFactory05_P",   // 5
+    "1P_CPLab01_P",       // 6
+    "1P_CPLab02_P",       // 7
+    "1P_CPLab03",         // 8
+    "1P_CPLab04_P",       // 9
+    "1P_CPLab05_P",       // 10
+    "1P_CPMine01_P",      // 11
+    "1P_CPMine02_P",      // 12
+    "1P_CPMine03_P",      // 13
+    "1P_CPMine04_P",      // 14
+    "1P_CPMine05_P",      // 15
+    "1P_SDColony01_P",    // 16
+    "1P_SDColony02_P",    // 17
+    "1P_SDColony03_P",    // 18
+    "1p_SDColony04_P",    // 19 (lowercase p � matches the level file)
+    "1P_SDColony05_P",    // 20
+    "1P_SDColony06_P",    // 21
+    "1P_SDDweller01_P",   // 22
+    "1P_SDDweller02_P",   // 23
+    "1P_SDDweller03_P",   // 24
+};
+static constexpr int kMissionMapCount = 24;
+
+std::string MatchmakingService::ForceNextMapByNumberAndDifficulty(
+        int map_number, uint32_t difficulty_value_id) {
+
+    if (map_number < 1 || map_number > kMissionMapCount)
+        return "Invalid mission number (1-" + std::to_string(kMissionMapCount) + ").";
+
+    const std::string map_name = kMissionMapNames[map_number];
+
+    int queues_set = 0;
+    for (auto& [qid, q] : queues_) {
+        if (!q.config.enabled) continue;
+        if (q.config.difficulty_value_id != difficulty_value_id) continue;
+        // Check map is in this queue's pool
+        for (const auto& entry : q.config.map_pool) {
+            if (entry.map_name == map_name) {
+                forced_maps_[qid] = MapModeSpec{ map_name, entry.game_mode };
+                Logger::Log("matchmaking",
+                    "[Matchmaking] ForceNextMap: queue %u ('%s') -> %s (%s)\n",
+                    qid, q.config.name.c_str(),
+                    map_name.c_str(), entry.game_mode.c_str());
+                ++queues_set;
+                break;
+            }
+        }
+    }
+
+    if (queues_set == 0)
+        return "Map " + map_name + " not found in any enabled queue at that difficulty.";
+
+    return "Next mission forced: " + map_name +
+           " (set on " + std::to_string(queues_set) + " queue(s)). Queue up to start it.";
+}

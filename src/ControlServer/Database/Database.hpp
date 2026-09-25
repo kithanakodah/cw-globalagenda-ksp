@@ -1,0 +1,548 @@
+#pragma once
+
+#include "sqlite3.h"
+#include <string>
+#include <vector>
+#include <map>
+#include <optional>
+#include <cstdint>
+
+class Database {
+private:
+    static sqlite3* connection;
+    static std::string db_path_;
+public:
+    static int Callback(void* data, int argc, char** argv, char** azColName);
+    static sqlite3* GetConnection();
+    static void CloseConnection();
+    static void Init();
+    static void SetDbPath(const std::string& path);
+
+    // Regenerates <db folder>/completions.json from ga_instances on every
+    // mission end. Exists so the PowerShell launcher can show completion
+    // tracking without needing a SQLite driver: plain text in, plain text
+    // out. Full regenerate (not append) so it self-heals and backfills.
+    static void ExportCompletionsJson();
+
+    // Returns "" (not found), "active", or "complete"
+    static std::string GetQuestStatus(int64_t character_id, int quest_id);
+    static void AcceptQuest(int64_t character_id, int quest_id);
+    static void CompleteQuest(int64_t character_id, int quest_id);
+    static void AbandonQuest(int64_t character_id, int quest_id);
+
+    // One requirement counter that moved as a result of a credit event.
+    struct QuestProgress {
+        int quest_id = 0;
+        int quest_requirement_id = 0;
+        int count = 0;        // new absolute count (clamped to required)
+        int required = 0;     // asm_data_set_quest_requirements.count
+        bool completed = false;  // count reached required on THIS credit
+    };
+
+    // Credit one kill of `bot_id` to `character_id`. Bumps every "Kill"
+    // (requirement_type_value_id 1428) requirement with a matching
+    // target_bot_id that belongs to one of the character's ACTIVE quests and
+    // isn't already at its required count. Returns only the rows that actually
+    // changed, so the caller can push exactly those to the client.
+    static std::vector<QuestProgress> CreditKillQuestRequirements(int64_t character_id,
+                                                                 int bot_id);
+
+    // One "Interact with Volume" (1431) Use press on `ui_volume_id`, reported by
+    // the DLL's TgOmegaVolume::Used hook. Stores into the same counter table as
+    // Kill and returns the requirements that moved, for the progress push.
+    //
+    // Credited to the USING player only, not the task force: unlike a kill
+    // (TgPawn.uc passes the killer's TaskForce), the Use press is an individual
+    // act and each member walks up to the volume themselves.
+    static std::vector<QuestProgress> CreditVolumeQuestRequirements(int64_t character_id,
+                                                                    int ui_volume_id);
+
+    // ---- Crafting components -------------------------------------------
+    //
+    // Components ARE real inventory rows on the client. The client computes
+    // Collect (1429) quest progress itself, by summing m_InventoryData
+    // .nInstanceCount over its m_InventoryMap entries whose nItemId matches
+    // (FUN_10a16310, reached from FUN_109ac070) — the COUNT we push in a quest
+    // progress packet is ignored for type 1429. So a component must exist as a
+    // SEND_INVENTORY record or the quest log stays at 0 and never completes.
+    //
+    // Stock is per USER, so all of an account's characters share one pool and a
+    // quest whose parts were already farmed turns in on the first interaction.
+    //
+    // ‼️ Every component row shipped to the client also has to be counted in
+    // ATgInventoryManager::r_ItemCount, or IsValid() fails and the equip screen
+    // blanks. See TcpSession::credit_loot_table + the set_item_count action.
+
+    struct ComponentRow {
+        int item_id = 0;
+        int quantity = 0;
+        int quality_value_id = 0;
+    };
+
+    // asm_data_set_bots.loot_table_id / asm_data_set_quests.loot_table_id.
+    static int GetBotLootTableId(int bot_id);
+    static int GetQuestRewardLootTableId(int quest_id);
+
+    // Roll a loot table -> {item_id: quantity} for the COMPONENT rows that
+    // dropped. Honours drop_chance, quantity and sub_loot_table_id recursion;
+    // non-component rows are rolled and discarded so odds stay faithful.
+    static std::map<int, int> RollLootTableComponents(int loot_table_id);
+
+    struct ComponentGrant {
+        int item_id = 0;
+        int quantity = 0;    // amount added by this grant
+        int new_total = 0;   // stack size afterwards
+        int quality_value_id = 0;
+        bool new_row = false;  // no live stack existed before this grant —
+                               // means a NEW client map entry, so r_ItemCount
+                               // has to grow by one
+    };
+    static std::vector<ComponentGrant> GrantComponents(int64_t user_id,
+                                                       const std::map<int, int>& items);
+
+    // Number of records send_inventory_response will ship for this user:
+    // device/cosmetic rows for the profile + every component row. This is the
+    // value ATgInventoryManager::r_ItemCount must hold, and it is the same
+    // expression the DLL's spawn / re-equip stamp sites use.
+    static int GetExpectedItemCount(int64_t user_id, int profile_id);
+
+    // Component stock for one user (0 when absent).
+    static int GetComponentCount(int64_t user_id, int item_id);
+    // The user's live component stacks. A depleted stack has no row — see
+    // ConsumeQuestRequirementItems.
+    static std::vector<ComponentRow> GetAllComponents(int64_t user_id);
+
+    // Spend the components a quest's Collect requirements asked for, and DELETE
+    // any stack that hits zero. Returns the item_ids removed, so the caller can
+    // push the matching STATE=2 records.
+    //
+    // A depleted stack must disappear from both sides. Keeping zero-quantity
+    // rows alive (the original design, to hold the client's map size steady)
+    // left "0 Units" ghosts littering the player's bag list, and made the DB row
+    // set and the client's map drift in ways nothing could observe. The client
+    // has a real removal path — INV_REPLICATION_STATE=2 → FUN_10a16190 →
+    // FUN_10a160e0 drops the map entry — so delete on both sides and restate
+    // r_ItemCount afterwards.
+    //
+    // Non-component targets (quest 5 wants a dye) are left alone.
+    static std::vector<int> ConsumeQuestRequirementItems(int64_t user_id, int quest_id);
+
+    // Remove up to `count` from one stack, deleting the row if it empties.
+    // Returns how many were actually taken. Used by the -components test hook;
+    // same delete-on-empty rule as ConsumeQuestRequirementItems.
+    static int TakeComponents(int64_t user_id, int item_id, int count);
+
+    struct QuestRequirementRow {
+        int quest_requirement_id = 0;
+        int requirement_type_value_id = 0;
+        int count = 0;
+        int target_item_id = 0;
+        int target_bot_id = 0;
+        int target_ui_volume_id = 0;
+    };
+    static std::vector<QuestRequirementRow> GetQuestRequirements(int quest_id);
+
+    // True when every requirement of `quest_id` is satisfied. Kill (1428) reads
+    // ga_character_quest_progress; Collect (1429) reads component stock — the
+    // same source the client uses, so server and client agree.
+    static bool AreQuestRequirementsMet(int64_t user_id, int64_t character_id, int quest_id,
+                                        std::vector<std::string>* unmet = nullptr);
+
+    // ---- Quest state sync (login / spawn) -----------------------------------
+    struct CharacterQuestState {
+        int quest_id = 0;
+        std::string status;      // "active" | "complete"
+        int64_t completed_at = 0;
+    };
+    static std::vector<CharacterQuestState> GetCharacterQuestStates(int64_t character_id);
+
+    // Requirement counters to replay for ONE active quest (Kill + Collect).
+    // pair = (quest_requirement_id, count).
+    static std::vector<std::pair<int, int>> GetQuestRequirementCounts(int64_t user_id,
+                                                                     int64_t character_id,
+                                                                     int quest_id);
+
+    // ---- User moderation: session history ----------------------------------
+    // outcome: "ok" (live or completed), "rejected" (validation failure),
+    // "banned" (ban triggered). Returns the row id, or 0 on failure.
+    static int64_t InsertSession(int64_t user_id_or_zero,
+                                 const std::string& username,
+                                 const std::string& ip,
+                                 const std::string& outcome);
+    // Sets logout_at = strftime('%s','now') on the given row.
+    static void FinalizeSession(int64_t session_row_id);
+
+    // ---- User moderation: bans ---------------------------------------------
+    struct ActiveBan {
+        int64_t     id        = 0;
+        std::string reason;
+        int64_t     banned_at = 0;
+    };
+    static std::optional<ActiveBan> FindActiveBanForUser(int64_t user_id);
+    static std::optional<ActiveBan> FindActiveBanForIp  (const std::string& ip);
+
+    static void InsertOrReplaceUserBan(int64_t user_id,       const std::string& reason);
+    static void InsertOrReplaceIpBan  (const std::string& ip, const std::string& reason);
+    static void LiftUserBan(int64_t user_id);
+    static void LiftIpBan  (const std::string& ip);
+
+    // ---- User moderation: dashboard read APIs ------------------------------
+    struct SessionRow {
+        int64_t                id       = 0;
+        int64_t                user_id  = 0;  // 0 = NULL in DB
+        std::string            username;
+        std::string            ip;
+        int64_t                login_at = 0;
+        std::optional<int64_t> logout_at;
+        std::string            outcome;
+    };
+    static std::vector<SessionRow> GetRecentSessionsDistinctByUser(int limit);
+    static std::vector<SessionRow> GetSessionsForUser(int64_t user_id, int limit);
+    static std::vector<SessionRow> GetSessionsForIp  (const std::string& ip, int limit);
+
+    struct ActiveBanRow {
+        int64_t     id              = 0;
+        int64_t     user_id_or_zero = 0;
+        std::string ip_or_empty;
+        std::string reason;
+        int64_t     banned_at       = 0;
+    };
+    static std::vector<ActiveBanRow> GetActiveUserBans();
+    static std::vector<ActiveBanRow> GetActiveIpBans();
+
+    // Username → user_id lookup (used by admin "ban" action when the
+    // dashboard sends a username rather than a numeric id). Returns 0 if
+    // the user does not exist.
+    static int64_t FindUserIdByUsername(const std::string& username);
+
+    // Set the operator "verified for PvP" flag on an account. Used by the
+    // dashboard "pvp-toggle" admin action. Returns false if the update failed.
+    static bool SetUserPvpVerification(int64_t user_id, bool verified);
+
+    // Read an account's "verified for PvP" flag. Returns false for unknown /
+    // invalid user_id. Used by the matchmaker to withhold unverified players
+    // from queues flagged requires_pvp_verification.
+    static bool IsUserVerifiedForPvp(int64_t user_id);
+
+    // Clear an account's password verifier (set password_verifier = NULL) so
+    // the player's next login re-registers their password (trust-on-first-use).
+    // Used by the dashboard "reset-password" admin action for players locked
+    // out after typing a throwaway password on their first verified login.
+    // registered_at is left untouched. Returns false if the update failed.
+    static bool ClearUserVerifier(int64_t user_id);
+
+    // ---- User roles (spectator mode, design 2026-07-18) --------------------
+    // Generic role grants on ga_users, e.g. "spectator". Control-server-owned
+    // and authoritative — the game-server DLL never queries this directly,
+    // it only trusts the pre-vetted flag threaded through the per-connection
+    // control message (see PlayerInfo.is_spectator).
+    static bool UserHasRole(int64_t user_id, const std::string& role);
+    static void GrantRole(int64_t user_id, const std::string& role);
+    static void RevokeRole(int64_t user_id, const std::string& role);
+
+    // Operator free-text note on an account (ga_users.admin_notes). Used by
+    // the dashboard "set-user-note" admin action. Empty string clears.
+    static bool SetUserAdminNotes(int64_t user_id, const std::string& notes);
+
+    // ---- Per-user key/value preferences (ga_user_preferences) --------------
+    // Same table the game-server DLL uses (e.g. show_broken_suits); control
+    // server owns matchmaking-side keys like "solo_mode". Get returns "" when
+    // the key is unset. Set upserts.
+    static std::string GetUserPreference(int64_t user_id, const std::string& key);
+    static bool SetUserPreference(int64_t user_id, const std::string& key,
+                                  const std::string& value);
+
+    // ---- DLC (launcher-managed map packs, 2026-07-30) ----------------------
+    // ga_dlc catalog + per-account ga_user_dlc installed flags. SetUserDlc
+    // resolves the launcher-facing string identifier and upserts the flag;
+    // returns false for an unknown identifier or failed write. Used by the
+    // "set-user-dlc" admin action (dashboard, later the launcher sync).
+    static bool SetUserDlc(int64_t user_id, const std::string& identifier,
+                           bool installed);
+    // dlc_ids the account has installed. Feeds the GET_TICKET_INFO filter
+    // that hides queues whose whole map pool needs packs the player lacks.
+    static std::vector<int64_t> GetInstalledDlcIds(int64_t user_id);
+    // Full ga_dlc catalog — used by the -enabledlc/-disabledlc chat commands
+    // for listings and name lookups in replies.
+    struct DlcRow {
+        int64_t dlc_id = 0;
+        std::string identifier;
+        std::string name;
+    };
+    static std::vector<DlcRow> GetAllDlc();
+
+    // Upsert one geo/VPN lookup result into ga_ip_checks (keyed by IP,
+    // checked_at = now). Used by the dashboard "store-ip-check" admin action;
+    // the dashboard reads the table directly.
+    static bool UpsertIpCheck(const std::string& ip,
+                              const std::string& country_code,
+                              const std::string& country,
+                              const std::string& isp,
+                              bool proxy, bool hosting);
+
+    // ---- Friends list (chat server, F3 menu) -------------------------------
+    struct FriendRow {
+        int64_t     friend_user_id = 0;
+        std::string friend_name;          // canonical ga_users.username
+        bool        ignore_flag = false;  // 0 = friend, 1 = ignore list
+        std::string notes;
+    };
+    static std::vector<FriendRow> GetFriendsForUser(int64_t user_id);
+    // Resolves `name` (case-insensitive) against ga_users and upserts the
+    // friendship row; re-adding an existing entry updates ignore_flag.
+    // Returns false if no such user exists.
+    static bool AddFriend(int64_t user_id, const std::string& name, bool ignore_flag);
+    static void RemoveFriend(int64_t user_id, int64_t friend_user_id);
+    static void SetFriendNotes(int64_t user_id, int64_t friend_user_id, const std::string& notes);
+    // True when `owner_name` has `other_name` on their ignore list (both are
+    // ga_users.username, matched case-insensitively). Used by the team-invite
+    // gate; chat gates use the ChatSession per-session cache instead.
+    static bool IsIgnoring(const std::string& owner_name, const std::string& other_name);
+    // Monotonic counter bumped on every ga_friends mutation. ChatSession
+    // compares it against its cached value to know when to reload its
+    // ignore set.
+    static uint64_t FriendsEpoch();
+    // Lowercased usernames on owner_name's ignore list.
+    static std::vector<std::string> GetIgnoredNames(const std::string& owner_name);
+
+    // ---- Match stats (design 2026-06-12) -----------------------------------
+    struct MatchEventRow {
+        int64_t instance_id = 0;
+        double  game_time   = 0;
+        std::string event_type;
+        // 0 = NULL for all identity/optional fields below.
+        int64_t actor_user_id = 0,  actor_character_id = 0;
+        int     actor_bot_id = 0,   actor_task_force = 0;
+        int64_t target_user_id = 0, target_character_id = 0;
+        int     target_bot_id = 0,  target_task_force = 0;
+        int64_t owner_user_id = 0,  owner_character_id = 0;
+        int     device_id = 0;
+        int64_t detail = 0;
+        int     flags = 0;
+    };
+    // Inserts one event row (ts stamped now). Returns rowid, 0 on failure.
+    static int64_t InsertMatchEvent(const MatchEventRow& row);
+
+    struct MatchPlayerStatsRow {
+        int64_t instance_id = 0, user_id = 0, character_id = 0;
+        int     task_force = 0;
+        int     scores[11] = {};   // r_Scores order (STYPE_*)
+        double  capture_seconds = 0, contest_seconds = 0;
+        int     objective_captures = 0;
+        int     beacon_spawns_provided = 0, beacon_spawns_used = 0;
+        int     beacons_destroyed = 0;
+        double  time_played_seconds = 0;
+    };
+    // Absolute totals; upsert on (instance_id, character_id, task_force).
+    static void UpsertMatchPlayerStats(const MatchPlayerStatsRow& row);
+
+    struct MatchDeviceStatsRow {
+        int64_t instance_id = 0, user_id = 0, character_id = 0;
+        int     task_force = 0, device_id = 0;
+        int     damage = 0, healing = 0;
+        int     player_kills = 0, bot_kills = 0;
+        int     debuffs_removed = 0, overheal = 0;
+        int     uses = 0, power_restored = 0, power_wasted = 0;
+        int     buffed_damage_dealt = 0, protected_damage_taken = 0;
+        int     rescues = 0;
+        int     boost_targets = 0, boost_overwrites = 0, boost_wasted_secs = 0;
+    };
+    // Absolute totals; upsert on (instance_id, character_id, task_force,
+    // device_id). device_id keys asm_data_set_devices.device_id.
+    static void UpsertMatchDeviceStats(const MatchDeviceStatsRow& row);
+
+    // Per-queue stats recording toggles (ga_queues.record_device_stats /
+    // record_effectiveness). Returns false/false when the queue row is
+    // missing — an unknown queue records nothing.
+    static void GetQueueStatsToggles(uint32_t queue_id,
+                                     bool& device_stats, bool& effectiveness);
+
+    // Write-once outcome stamp (WHERE outcome IS NULL AND is_home_map=0).
+    // winning_task_force 0 = NULL.
+    static void SetInstanceOutcomeIfNull(int64_t instance_id,
+                                         const std::string& outcome,
+                                         int winning_task_force);
+
+    // Final per-taskforce team-death totals from MSG_MISSION_ENDED
+    // (challenge bonus source data).
+    static void SetInstanceDeathCounts(int64_t instance_id,
+                                       int count_deaths_attackers,
+                                       int count_deaths_defenders);
+
+    // ---- Agencies (design 2026-07-18) --------------------------------------
+    struct AgencyMemberRow {
+        int64_t     user_id      = 0;
+        int64_t     character_id = 0;
+        std::string player_name;
+        int         rank_id      = 0;
+        std::string public_comment;
+        std::string officer_comment;
+        uint32_t    profile_id = 0;   // ga_characters.profile_id (class), joined in
+    };
+    // PERMISSION_FLAGS (0x3B0) bits, read off single-checkbox AGENCY_UPDATE_RANKS
+    // submits from the Management tab's "Rank Abilities" panel. Bits 0-3 (0x0F)
+    // ride along on every submit but map to no visible checkbox.
+    enum AgencyPerm : uint32_t {
+        AGENCY_PERM_PROMOTE            = 0x00000040,
+        AGENCY_PERM_DEMOTE             = 0x00000080,
+        AGENCY_PERM_INVITE             = 0x00000100,
+        AGENCY_PERM_KICK               = 0x00000200,
+        AGENCY_PERM_EDIT_DESCRIPTION   = 0x00000400,
+        AGENCY_PERM_EDIT_PUBLIC_MSG    = 0x00000800,
+        AGENCY_PERM_EDIT_OFFICER_MSG   = 0x00001000,
+        AGENCY_PERM_VIEW_OFFICER_MSG   = 0x00002000,
+        AGENCY_PERM_EDIT_MOTD          = 0x00008000,
+        AGENCY_PERM_FACILITY_MGMT      = 0x00020000,
+        AGENCY_PERM_INVENTORY_REMOVAL  = 0x00040000,
+    };
+
+    struct AgencyRankRow {
+        int         rank_id     = 0;
+        int         rank_level  = 0;
+        int         permissions = 0;
+        std::string rank_name;
+    };
+    struct AgencyInfo {
+        int64_t     id = 0;
+        std::string name;
+        std::string motd;
+        std::string information;
+        float       color_r = 0, color_g = 0, color_b = 0;
+        bool        recruiting = false;
+        std::string recruiting_text;
+        bool        sub_only = false;
+        int64_t     leader_user_id = 0;
+        std::vector<AgencyMemberRow> members;
+        std::vector<AgencyRankRow>   ranks;
+    };
+
+    // Create an agency owned by leader_user_id. Seeds the 3 default ranks and
+    // adds the leader as a member at the top rank, atomically. Returns the new
+    // agency id, or 0 on failure (name already taken, or the account is already
+    // in an agency).
+    static int64_t CreateAgency(const std::string& name,
+                                float r, float g, float b,
+                                int64_t leader_user_id,
+                                int64_t leader_character_id,
+                                const std::string& leader_name);
+
+    // Agency id the account currently belongs to, or 0 if none.
+    static int64_t GetAgencyIdForUser(int64_t user_id);
+
+    // Full agency record (meta + members + ranks), or nullopt if not found.
+    static std::optional<AgencyInfo> GetAgencyInfo(int64_t agency_id);
+
+    // Delete an agency and everything attached: its members, ranks, any alliance
+    // it owns (+ that alliance's memberships), and its own alliance membership.
+    static void DisbandAgency(int64_t agency_id);
+
+    // Add an account to an agency (invite-accept). rank_id 2 = default Member.
+    // Returns false if the account is already in an agency or the insert failed.
+    static bool AddAgencyMember(int64_t agency_id, int64_t user_id,
+                                int64_t character_id,
+                                const std::string& player_name,
+                                int rank_id);
+
+    // Change a member's rank (promote / demote). Member keyed by character_id —
+    // that's what the client sends back as PLAYER_ID. False if no such member.
+    static bool SetAgencyMemberRank(int64_t agency_id, int64_t character_id,
+                                    int rank_id);
+
+    // Drop a member from an agency (kick / leave). Keyed by user_id (the
+    // table's PK) — the stored character_id is only a join-time snapshot.
+    static bool RemoveAgencyMember(int64_t agency_id, int64_t user_id);
+
+    // ---- Alliances (groups of agencies) ------------------------------------
+    struct AllianceMemberRow {
+        int64_t     agency_id       = 0;
+        std::string agency_name;
+        int         member_count    = 0;  // agents in that agency
+        int         territory_count = 0;
+    };
+    struct AllianceInfo {
+        int64_t     id = 0;
+        std::string name;
+        std::string motd;
+        std::string information;
+        int64_t     owner_agency_id = 0;
+        std::string owner_agency_name;
+        int64_t     created_at = 0;   // unix seconds
+        std::vector<AllianceMemberRow> members;
+    };
+
+    // Alliance id the agency currently belongs to, or 0 if none.
+    static int64_t GetAllianceIdForAgency(int64_t agency_id);
+
+    // Create an alliance owned by owner_agency_id and add it as the first
+    // member, atomically. Returns the new alliance id, or 0 on failure (name
+    // taken, or the agency is already in an alliance).
+    static int64_t CreateAlliance(const std::string& name, int64_t owner_agency_id);
+
+    // Add an agency to an alliance (invite-accept / join). Returns false if the
+    // agency is already in an alliance or the insert failed.
+    static bool AddAgencyToAlliance(int64_t alliance_id, int64_t agency_id);
+
+    // Full alliance record (meta + member agencies), or nullopt if not found.
+    static std::optional<AllianceInfo> GetAllianceInfo(int64_t alliance_id);
+
+    // Delete an alliance + all its agency memberships.
+    static void DisbandAlliance(int64_t alliance_id);
+
+    // Remove one agency from its alliance (member leave / owner kick).
+    static void RemoveAgencyFromAlliance(int64_t agency_id);
+
+    // Agency MOTD (is_motd) or description/information text.
+    static bool SetAgencyText(int64_t agency_id, bool is_motd,
+                              const std::string& text);
+
+    // A member's public or officer note. Member keyed by character_id.
+    static bool SetAgencyMemberComment(int64_t agency_id, int64_t character_id,
+                                       bool officer, const std::string& text);
+
+    // Replace an agency's whole rank table (AGENCY_UPDATE_RANKS sends every row,
+    // so adds / renames / permission edits / deletes all arrive together).
+    // Members sitting on a deleted rank fall to the lowest-authority rank left.
+    static bool ReplaceAgencyRanks(int64_t agency_id,
+                                   const std::vector<AgencyRankRow>& ranks);
+
+    // Recruiting listing: text + the two flags (Recruiting Members / AvA Only).
+    static bool SetAgencyRecruiting(int64_t agency_id, const std::string& text,
+                                    bool recruiting, bool sub_only);
+
+    // Hand the agency to another account (Transfer Leader). Rank rows are moved
+    // by the caller; this only updates ga_agencies.leader_user_id.
+    static bool SetAgencyLeader(int64_t agency_id, int64_t user_id);
+
+    // user_id -> {map name, class}, for the agency's members currently in a
+    // running instance. profile_id is the class of the character they are
+    // playing NOW (a character is one class), not the join-time snapshot.
+    // One query per roster poll; deliberately narrower than
+    // InstanceRegistry::GetActiveSearchablePlayers (which joins users/players
+    // for the name columns the roster already has).
+    struct OnlineAgencyMemberRow {
+        std::string map_name;
+        uint32_t    profile_id = 0;
+    };
+    static std::map<int64_t, OnlineAgencyMemberRow> GetOnlineAgencyMembers(int64_t agency_id);
+
+    // Every account in every agency of an alliance. Used to push alliance-state
+    // changes to the players affected, so their panels don't need a relog.
+    static std::vector<int64_t> GetAllianceMemberUserIds(int64_t alliance_id);
+
+    // Every account in one agency.
+    static std::vector<int64_t> GetAgencyMemberUserIds(int64_t agency_id);
+
+    // Agency led by the account whose leader player_name matches (rank_id 0 =
+    // leader). Used to resolve ALLIANCE_INVITE (invite by leader name). 0 if none.
+    static int64_t GetAgencyIdByLeaderName(const std::string& leader_name);
+
+    // character_id -> {agency name, alliance name} for every character of
+    // every agency member account (membership is per account). Whole table in
+    // one query — the Team window and player search need the two name columns
+    // for a list of characters at once.
+    struct AffiliationRow {
+        std::string agency_name;
+        std::string alliance_name;   // "" when the agency is in no alliance
+    };
+    static std::map<int64_t, AffiliationRow> GetAffiliationsByCharacter();
+};

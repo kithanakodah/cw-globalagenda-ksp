@@ -1,0 +1,282 @@
+#include "src/Config/Config.hpp"
+#include "src/GameServer/Constants/GameTypes.h"
+#include "src/Utils/CommandLineParser/CommandLineParser.hpp"
+#include "src/Utils/Logger/Logger.hpp"
+
+static std::string DetectLocalIP() {
+	// Connect a UDP socket to an external address to discover which
+	// local interface (and thus which IP) the OS would use for outbound traffic.
+	SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s == INVALID_SOCKET) return "127.0.0.1";
+
+	sockaddr_in probe = {};
+	probe.sin_family = AF_INET;
+	probe.sin_port   = htons(53);
+	probe.sin_addr.s_addr = inet_addr("8.8.8.8");
+
+	if (connect(s, reinterpret_cast<sockaddr*>(&probe), sizeof(probe)) == SOCKET_ERROR) {
+		closesocket(s);
+		return "127.0.0.1";
+	}
+
+	sockaddr_in local = {};
+	int len = sizeof(local);
+	getsockname(s, reinterpret_cast<sockaddr*>(&local), &len);
+	closesocket(s);
+
+	char buf[INET_ADDRSTRLEN] = {};
+	const char* result = inet_ntoa(local.sin_addr);
+	if (result) strncpy(buf, result, sizeof(buf) - 1);
+	return buf;
+}
+
+std::string Config::GetIpChar() {
+	Logger::Log("config", "GetIpChar\n");
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+
+	if (!options.switches[L"host"].empty()) {
+		return CommandLineParser::WideToUtf8(options.switches[L"host"]);
+	}
+
+	std::string detected = DetectLocalIP();
+	Logger::Log("config", "GetIpChar: auto-detected IP = %s\n", detected.c_str());
+	return detected;
+}
+
+int Config::GetPort() {
+	Logger::Log("config", "GetPort\n");
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+
+	std::wstring port = options.switches[L"port"].empty() ? L"9002" : options.switches[L"port"];
+
+	return std::stoi(CommandLineParser::WideToUtf8(port));
+}
+
+std::wstring Config::GetMapUrl() {
+	Logger::Log("config", "GetMapUrl\n");
+
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+
+	std::wstring ip = options.switches[L"host"].empty() ? L"127.0.0.1" : options.switches[L"host"];
+	std::wstring port = options.switches[L"port"].empty() ? L"9002" : options.switches[L"port"];
+
+	std::wstring mapName = options.level.mapName;
+	std::wstring mapParams;
+	std::map<std::wstring, std::wstring> params = options.level.params;
+
+	for (auto& [key, value] : params) {
+		mapParams += L"?";
+		mapParams += key;
+		mapParams += L"=";
+		mapParams += value;
+	}
+
+	std::wstring url = ip + L":" + port + L"/" + mapName + mapParams;
+
+	return url;
+}
+
+std::string Config::GetMapNameChar() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+
+	return CommandLineParser::WideToUtf8(options.level.mapName);
+}
+
+std::wstring Config::GetMapParams() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+
+	std::wstring mapParams;
+	std::map<std::wstring, std::wstring> params = options.level.params;
+	for (auto& [key, value] : options.level.params) {
+		mapParams += L"?";
+		mapParams += key;
+		mapParams += L"=";
+		mapParams += value;
+	}
+
+	return mapParams;
+}
+
+std::string Config::GetMapParamsChar() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+
+	std::string mapParams;
+	std::map<std::wstring, std::wstring> params = options.level.params;
+	for (auto& [key, value] : options.level.params) {
+		mapParams += "?";
+		mapParams += CommandLineParser::WideToUtf8(key);
+		mapParams += "=";
+		mapParams += CommandLineParser::WideToUtf8(value);
+	}
+
+	return mapParams;
+}
+
+int Config::GetDifficultyValueId() {
+	// -difficulty=<value_id> from the control-server spawn (sourced from
+	// ga_queues.difficulty_value_id). Takes precedence over the map-name
+	// heuristic below. Empty/missing -> fall through.
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"difficulty"];
+	if (!val.empty()) {
+		try {
+			int parsed = std::stoi(CommandLineParser::WideToUtf8(val));
+			if (parsed > 0) return parsed;
+		} catch (...) {
+			// Bad value — fall through to the heuristic. Don't crash the
+			// instance over a malformed CLI flag.
+		}
+	}
+
+	std::string MapName = GetMapNameChar();
+	if (MapName == "Inception_ALL" || MapName == "Inception_3_TEMP" || MapName == "Adrenaline_P" || MapName == "Skylark_P" || MapName == "AgencyZero_P") {
+		return 1028;
+	}
+	// return 1030;
+	// return 1028;
+	return 1471;
+}
+
+float Config::GetDifficultyScalar() {
+    {
+        ParsedOptions options = CommandLineParser::ParseCommandLine();
+        std::wstring ts = options.switches[L"tierscalar"];
+        if (!ts.empty()) {
+            try { return std::stof(CommandLineParser::WideToUtf8(ts)); } catch (...) {}
+        }
+    }
+	switch (GetDifficultyValueId()) {
+		case GA_G::DIFFICULTY_VALUE_ID_LOW_SECURITY:
+		case GA_G::DIFFICULTY_VALUE_ID_NOVICE:               return 1.0f;
+		case GA_G::DIFFICULTY_VALUE_ID_MEDIUM_SECURITY:
+		case GA_G::DIFFICULTY_VALUE_ID_ADEPT:                return 1.25f;
+		case GA_G::DIFFICULTY_VALUE_ID_HIGH_SECURITY:
+		case GA_G::DIFFICULTY_VALUE_ID_DOUBLE_AGENT:
+		case GA_G::DIFFICULTY_VALUE_ID_ADVANCED:             return 1.50f;
+		case GA_G::DIFFICULTY_VALUE_ID_MAXIMUM_SECURITY:
+		case GA_G::DIFFICULTY_VALUE_ID_EXPERT:               return 1.75f;
+		case GA_G::DIFFICULTY_VALUE_ID_ULTRA_MAX_SECURITY:   return 2.0f;
+		case GA_G::DIFFICULTY_VALUE_ID_CUSTOM_SUPER_AGENT:   return 2.25f;
+		default:                                             return 1.0f;
+	}
+}
+
+uint16_t Config::GetIpcPort() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring port = options.switches[L"ipc_port"];
+	if (port.empty()) port = options.switches[L"ipcport"];
+	if (port.empty()) port = L"9010";
+	return static_cast<uint16_t>(std::stoi(CommandLineParser::WideToUtf8(port)));
+}
+
+std::string Config::GetIpcHost() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	if (!options.switches[L"ipc_host"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"ipc_host"]);
+	if (!options.switches[L"ipchost"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"ipchost"]);
+	return "127.0.0.1";
+}
+
+int64_t Config::GetInstanceId() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"instanceid"];
+	if (val.empty()) return 0;
+	return static_cast<int64_t>(std::stoll(CommandLineParser::WideToUtf8(val)));
+}
+
+std::string Config::GetDbPath() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	if (!options.switches[L"dbpath"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"dbpath"]);
+	if (!options.switches[L"db_path"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"db_path"]);
+	return "server.db";
+}
+
+std::string Config::GetGamePath() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	if (!options.switches[L"gamepath"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"gamepath"]);
+	return "";
+}
+
+bool Config::GetFixPackageGuids() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"fixpackageguids"];
+	if (val.empty()) return true; // default: on
+	return val == L"1";
+}
+
+std::string Config::GetCrashDir() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	if (!options.switches[L"crashdir"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"crashdir"]);
+	// Fallback matches the historical hardcoded value (Wine Z: maps / on host).
+	return "Z:\\home\\zax\\games\\crashes";
+}
+
+std::string Config::GetLogDir() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	if (!options.switches[L"logdir"].empty())
+		return CommandLineParser::WideToUtf8(options.switches[L"logdir"]);
+	// Fallback matches the historical "C:\<channel>.txt" path inside drive_c.
+	return "C:";
+}
+
+// Parse a comma-separated list switch into a vector of channel names.
+// Empty switch (missing or "-foo=") yields an empty vector — i.e. no channels.
+static std::vector<std::string> ParseCsvSwitch(const std::wstring& switchName) {
+	std::vector<std::string> out;
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring value = options.switches[switchName];
+	if (value.empty()) return out;
+
+	std::string utf8 = CommandLineParser::WideToUtf8(value);
+	size_t start = 0;
+	while (start <= utf8.size()) {
+		size_t pos = utf8.find(',', start);
+		if (pos == std::string::npos) pos = utf8.size();
+		if (pos > start) out.emplace_back(utf8.substr(start, pos - start));
+		start = pos + 1;
+	}
+	return out;
+}
+
+std::vector<std::string> Config::GetEnabledChannels() {
+	return ParseCsvSwitch(L"enabledchannels");
+}
+
+std::vector<std::string> Config::GetEnabledCrashChannels() {
+	return ParseCsvSwitch(L"enabledcrashchannels");
+}
+
+bool Config::GetClearLogs() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"clearlogs"];
+	if (val.empty()) return false; // default: keep prior logs
+	return val == L"1" || val == L"true";
+}
+
+bool Config::GetDumpMapData() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"dumpmapdata"];
+	if (val.empty()) return false;
+	return val == L"1" || val == L"true";
+}
+
+bool Config::GetDumpKismet() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"dumpkismet"];
+	if (val.empty()) return false;
+	return val == L"1" || val == L"true";
+}
+
+bool Config::GetNativeWindowsRuntime() {
+	ParsedOptions options = CommandLineParser::ParseCommandLine();
+	std::wstring val = options.switches[L"nativewindows"];
+	if (val.empty()) return false;
+	return val == L"1" || val == L"true";
+}
+
+

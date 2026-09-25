@@ -1,0 +1,192 @@
+#pragma once
+
+#include <asio.hpp>
+
+#include <string>
+#include <vector>
+#include <deque>
+#include <optional>
+#include <functional>
+#include <unordered_map>
+#include <chrono>
+#include <memory>
+#include <cstdint>
+
+#include "src/ControlServer/MatchmakingService/Domain.hpp"
+#include "src/ControlServer/MatchmakingService/MatchRule.hpp"
+
+// ---------------------------------------------------------------------------
+// PendingMatch — a spawned instance whose players haven't yet reported in.
+// (Orchestration state, not part of the pure domain.)
+// ---------------------------------------------------------------------------
+
+struct PendingMatch {
+    int64_t instance_id = 0;
+    uint32_t queue_id = 0;
+    std::string map_name;   // spawn map — gates DLC-aware coalescing
+    std::string game_mode;
+    std::vector<std::string> session_guids;
+    std::unordered_map<std::string, int> task_force_assignments;  // guid -> task_force
+    std::unordered_map<std::string, uint32_t> profile_ids;        // guid -> profile_id
+    std::unordered_map<std::string, double> mmrs;                 // guid -> stamped rating
+    uint32_t cap = 0;  // 0 = unlimited; hard ceiling on session_guids.size()
+
+    // Access semantics carried from the rule. Coalesce only appends to OPEN
+    // pendings; PARTY_LOCKED/SEALED never accept stranger coalescing.
+    AccessMode access_mode = AccessMode::Open;
+    std::vector<uint64_t> owner_party_ids;
+};
+
+// ---------------------------------------------------------------------------
+// MatchmakingService -- collects parties into queues, evaluates rules.
+// ---------------------------------------------------------------------------
+
+class MatchmakingService {
+public:
+    using MatchPopCallback = std::function<void(uint32_t queue_id, MatchResult result)>;
+    using InstanceProvider = std::function<std::vector<RunningInstance>(uint32_t queue_id)>;
+
+    static void Init();
+    static void ReloadQueues();
+
+    // External poke: re-evaluate a queue outside the usual queue-change
+    // triggers (e.g. a PLAYER_LEFT vacancy on a backfill_only instance).
+    // Backfill routing results flow immediately; fresh-spawn results keep
+    // normal delay semantics.
+    static void EvaluateQueue(uint32_t queue_id);
+
+    // --- Party / player queue management -----------------------------------
+
+    // Queue a whole party (solo of 1 or a team of N). The party is atomic from
+    // here on: it pops, coalesces, and dequeues as a unit.
+    static void AddParty(uint32_t queue_id, const QueuedParty& party);
+
+    // Convenience: queue a single player as a solo party. Synthesises a stable
+    // solo party_id from the session guid.
+    static void AddPlayer(uint32_t queue_id, const QueuedPlayer& player);
+
+    // Remove a party (by id) from whatever queue holds it. Returns true if it
+    // was queued. Used by TeamService on any composition change. Does NOT touch
+    // pending/ready state (a popped party is past the dequeue point).
+    static bool RemoveParty(uint64_t party_id);
+
+    // Remove the party CONTAINING this guid from its queue (parties are atomic)
+    // AND scrub the guid from pending matches + ready reservations. Used by
+    // generic per-session cleanup (disconnect, relogin, match cancel, leave).
+    static void RemovePlayer(const std::string& session_guid);
+
+    // Stable synthetic party id for a solo session (top bit set so it never
+    // collides with TeamService team ids, which are small positive integers).
+    static uint64_t SoloPartyId(const std::string& session_guid);
+
+    // -togglesolomode while already queued: update the queued solo party's
+    // solo_lock flag in place so the toggle applies without re-queuing.
+    // No-op if the guid isn't queued or is queued as part of a team.
+    static void SetSoloLockForQueuedPlayer(const std::string& session_guid, bool solo_lock);
+
+    // --- Callbacks / context ----------------------------------------------
+
+    static void SetMatchPopCallback(MatchPopCallback cb);
+    static void SetInstanceProvider(InstanceProvider provider);
+    static void SetIoContext(asio::io_context* io);
+
+    // --- Pending / ready reservation bookkeeping (unchanged surface) -------
+
+    static void AddPendingMatch(int64_t instance_id, PendingMatch match);
+    static std::optional<PendingMatch> ConsumePendingMatch(int64_t instance_id);
+    static void TrackReadyMatchReservations(
+        int64_t instance_id,
+        uint32_t queue_id,
+        const std::string& game_mode,
+        const std::vector<std::string>& session_guids,
+        const std::unordered_map<std::string, int>& task_force_assignments,
+        const std::unordered_map<std::string, uint32_t>& profile_ids,
+        const std::unordered_map<std::string, double>& mmrs,
+        uint32_t cap);
+    static std::vector<RunningInstance> GetReservedReadyInstances(uint32_t queue_id);
+    static void RemoveReadyMatchReservation(
+        int64_t instance_id, const std::string& session_guid, const char* reason);
+    static void RemoveReadyMatchReservation(
+        const std::string& session_guid, const char* reason);
+    static void DropReadyMatchReservations(int64_t instance_id);
+
+    static void SetPreAssignedTeam(int64_t instance_id, const std::string& guid, int tf);
+    static std::optional<int>
+        ConsumePreAssignedTeam(int64_t instance_id, const std::string& guid);
+    static void DropPreAssignedTeams(int64_t instance_id);
+
+    static void DiscardPendingMatchForDeadInstance(int64_t instance_id, const char* reason);
+
+    static bool GetContinueInQueue(uint32_t queue_id);
+    static std::vector<QueueConfig> GetEnabledQueueConfigs();
+    static std::optional<QueueConfig> GetQueueConfig(uint32_t queue_id);
+
+    // Cap of a single instance for this queue (delegates to mm::QueueInstanceCap;
+    // kept as a member for the existing call sites in main.cpp / encoder).
+    static uint32_t GetQueueInstanceCap(
+        const QueueConfig& cfg, uint32_t instance_max_players = 0);
+
+    struct QueuedProfileCounts { uint32_t assault, medic, recon, robotics; };
+    static QueuedProfileCounts GetQueuedProfileCounts(uint32_t queue_id);
+
+    static std::optional<uint32_t>
+        GetDelayedPopRemainingSeconds(uint32_t queue_id);
+
+    // `installed_sets` (optional): one installed-DLC id list per player who
+    // will play the picked map (successor spawns). When given, DLC-locked
+    // entries narrow to those owned by every player — or, if none, to those
+    // owned by the most players — before the usual count/weight/recency logic.
+    static std::optional<MapModeSpec>
+        PickRandomMapPoolEntryForCount(uint32_t queue_id, int count,
+            const std::vector<std::vector<int64_t>>* installed_sets = nullptr);
+
+    // Force the next map pick for all queues matching difficulty_value_id
+    // that contain map_number (1-24) in their pool. Called by -mission command.
+    // Returns a human-readable reply describing what was set (or the error).
+    static std::string ForceNextMapByNumberAndDifficulty(int map_number,
+                                                          uint32_t difficulty_value_id);
+    static std::string ClearForcedMaps();
+
+private:
+    struct DelayedPop {
+        float next_duration = 0.0f;
+        std::shared_ptr<asio::steady_timer> timer;
+        std::chrono::steady_clock::time_point fires_at;
+    };
+
+    struct Queue {
+        QueueConfig config;
+        std::unique_ptr<MatchRule> rule;
+        std::vector<QueuedParty> parties;          // the unit of queueing
+        std::optional<DelayedPop> delayed_pop;
+        // Recently picked map names, most recent first. In-memory only —
+        // survives ReloadQueues (like parties), resets on server restart.
+        std::deque<std::string> recent_maps;
+        // Strict-queue exclusion priority: guid -> times left behind by a
+        // strict pop. In-memory only — survives ReloadQueues, resets on
+        // restart. Cleared per guid on any match entry from this queue.
+        std::unordered_map<std::string, uint32_t> exclusion_counts;
+    };
+
+    static std::unordered_map<uint32_t, Queue> queues_;
+    // Per-queue forced map override. Set by -mission, consumed on next pick.
+    static std::unordered_map<uint32_t, MapModeSpec> forced_maps_;
+    static MatchPopCallback on_match_pop_;
+    static InstanceProvider instance_provider_;
+    static std::unordered_map<int64_t, PendingMatch> pending_matches_;
+    static std::unordered_map<int64_t, PendingMatch> ready_match_reservations_;
+    static std::unordered_map<int64_t,
+                              std::unordered_map<std::string, int>>
+        pre_assigned_teams_;
+    static asio::io_context* io_ctx_;
+
+    static void TryPop(uint32_t queue_id, bool delay_elapsed = false);
+    static void OnQueueChanged(uint32_t queue_id, const char* trigger,
+                               const std::string& who);
+    static void MaybeResetDelayedPop(Queue& q, const char* trigger,
+                                     const std::string& guid);
+    static Queue BuildQueue(QueueConfig cfg);
+
+    // Total players currently in a queue's parties (for min-to-pop, delay).
+    static size_t QueuedPlayerCount(const Queue& q);
+};

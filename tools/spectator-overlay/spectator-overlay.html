@@ -1,0 +1,2313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Spectator Overlay</title>
+<style>
+  /* Team colors as swappable variables -- "Swap Colours" in the layout
+     controls flips these on body.colors-swapped rather than touching every
+     rule that uses them, for PVE spectating where attacker/defender framing
+     doesn't map cleanly and the operator just wants a QoL "make my team
+     blue" toggle. Three shade tiers matching what was already in use
+     (labels/ticket/pips, brighter tug-bar fills, dark payload segments) --
+     kept as-is rather than unified into one shade, so this doesn't
+     re-theme anything, just makes the existing palette swappable.
+     Colors NOT tied to these (health-bar low-HP red, the hostile "boss"
+     bar's default red, the overtime-timer's warning orange) are deliberately
+     left as their own hardcoded values -- they aren't team-semantic, so
+     swapping would misrepresent them as attacker/defender-affiliated. */
+  :root {
+    --color-atk: #ff8a5c;
+    --color-def: #5cc7ff;
+    --color-atk-bright: #e53935;
+    --color-def-bright: #2196f3;
+    --color-atk-dark: #7a1f1f;
+    --color-def-dark: #0d3a55;
+  }
+  body.colors-swapped {
+    --color-atk: #5cc7ff;
+    --color-def: #ff8a5c;
+    --color-atk-bright: #2196f3;
+    --color-def-bright: #e53935;
+    --color-atk-dark: #0d3a55;
+    --color-def-dark: #7a1f1f;
+  }
+
+  /* Transparent by design — this is meant to sit as an OBS Browser Source
+     cropped/composited over gameplay footage, not viewed as its own page. */
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    font-family: "Segoe UI", Arial, sans-serif;
+    overflow: hidden;
+  }
+
+  #root {
+    display: flex;
+    justify-content: space-between;
+    align-items: center; /* vertically centers both team panels */
+    width: 100vw;
+    height: 100vh;
+    box-sizing: border-box;
+    padding: 16px;
+    /* Extra top clearance below the layout-controls strip (see
+       #layout-controls) so a broadcast crop can remove just that strip
+       without also cutting off the ATTACKERS/DEFENDERS labels underneath.
+       Dropped back to the normal 16px once the admin bar is hidden (see
+       body.admin-hidden below) -- no strip to clear then, and centering
+       looks better using the full viewport height. */
+    padding-top: 52px;
+  }
+
+  body.admin-hidden #root {
+    padding-top: 16px;
+  }
+
+  .team-panel {
+    --scale: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 320px;
+    transform: scale(var(--scale));
+  }
+
+  .team-panel.attackers { transform-origin: top left; }
+  .team-panel.defenders { align-items: flex-end; transform-origin: top right; }
+
+  .team-label {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #ffffff;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    margin-bottom: 2px;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }
+
+  .cards-container {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+  }
+
+  .attackers .team-label { color: var(--color-atk); }
+  .defenders .team-label { color: var(--color-def); }
+
+  .player-card {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  /* Icon + health pill sit side by side; the effects bar goes underneath
+     both (see .effects-row), not inside the pill itself. */
+  .player-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .class-icon {
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: rgba(12, 14, 20, 0.72);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .class-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  /* The pill's own background IS the health bar -- .health-pill-fill is an
+     absolutely-positioned layer inside it that grows/shrinks with current
+     HP%, so the "empty" portion is just the pill's own dark background
+     showing through rather than a separate bar element. */
+  .health-pill {
+    position: relative;
+    flex: 1 1 auto;
+    height: 32px;
+    min-width: 0;
+    border-radius: 4px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.35);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.5), inset 0 1px 2px rgba(0,0,0,0.6);
+    overflow: hidden;
+  }
+
+  .health-pill-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    transition: width 150ms linear, background-color 200ms linear;
+    /* Depth: a top-lit gloss fading into a darker lower edge, plus an inner
+       shadow so the fill reads as a raised bar rather than a flat block. */
+    background-image:
+      linear-gradient(to bottom, rgba(255,255,255,0.35) 0%, rgba(255,255,255,0.05) 45%, rgba(0,0,0,0.15) 100%);
+    background-blend-mode: overlay;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.4), inset 0 -3px 5px rgba(0,0,0,0.35);
+  }
+
+  /* Thin secondary bar under the health pill for power/energy -- same
+     pill-is-the-bar convention as .health-pill, just shorter, and aligned
+     past the class icon the same way .effects-row is. Too thin (6px) to fit
+     a current/max label inside it like .health-pill-hp does, so the bar
+     track and its text label are laid out side by side in a row instead. */
+  .power-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 3px;
+    margin-left: 38px;
+  }
+
+  .power-pill-track {
+    position: relative;
+    flex: 1 1 auto;
+    height: 6px;
+    min-width: 0;
+    border-radius: 3px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.25);
+    overflow: hidden;
+  }
+
+  .power-pill-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    background: #29b6d8;
+    transition: width 150ms linear;
+  }
+
+  .power-pill-text {
+    flex: 0 0 auto;
+    font-size: 9px;
+    font-variant-numeric: tabular-nums;
+    color: rgba(255,255,255,0.75);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    white-space: nowrap;
+  }
+
+  .defenders .power-pill {
+    margin-left: 0;
+    margin-right: 38px;
+    flex-direction: row-reverse;
+  }
+
+  .health-pill-name,
+  .health-pill-hp {
+    position: relative; /* sits above .health-pill-fill in paint order */
+    z-index: 1;
+  }
+
+  .health-pill-name {
+    position: absolute;
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 13px;
+    font-weight: 600;
+    color: #f0f0f0;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: calc(100% - 70px);
+  }
+
+  .health-pill-hp {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 10px;
+    color: rgba(255,255,255,0.75);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  /* Effects bar -- a distinct strip underneath each player's icon+pill row,
+     not embedded inside the pill. */
+  .effects-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+    margin-left: 38px; /* aligns under the pill, past the class icon + gap */
+    padding: 3px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.35);
+    /* Always reserve icon-row height, even with zero active effects, so a
+       buff appearing/disappearing doesn't shove the pill above it up and
+       down — the empty row just sits there invisibly until something fills it. */
+    min-height: calc(var(--icon-size, 24px) + 6px);
+  }
+
+  /* Defenders mirror -- class icon on the right, name/hp text swapped
+     sides, health fill grows from the right, effects bar anchored/ordered
+     from the right. Same elements/classes as attackers, just re-anchored;
+     no JS branching needed for any of this. */
+  .defenders .player-row {
+    flex-direction: row-reverse;
+  }
+
+  .defenders .health-pill-fill {
+    left: auto;
+    right: 0;
+  }
+
+  .defenders .health-pill-name {
+    left: auto;
+    right: 12px;
+    text-align: right;
+  }
+
+  .defenders .health-pill-hp {
+    right: auto;
+    left: 10px;
+  }
+
+  .defenders .effects-row {
+    margin-left: 0;
+    margin-right: 38px;
+    flex-direction: row-reverse;
+  }
+
+  .effect-tag {
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.14);
+    color: #f5f5f5;
+    white-space: nowrap;
+  }
+
+  /* Icon variant — replaces the text pill once an id is mapped to an image. */
+  .effect-tag.effect-tag-icon {
+    padding: 2px;
+    width: var(--icon-size, 24px);
+    height: var(--icon-size, 24px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255,255,255,0.08);
+  }
+
+  .effect-tag.effect-tag-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    image-rendering: -webkit-optimize-contrast;
+  }
+
+  /* Overflow badge — replaces the (MAX_VISIBLE_EFFECTS+1)th icon onward so a
+     heavily-buffed player can never grow tall enough to push the cards below
+     them off-frame. Same box size as an icon tile so it doesn't disturb the
+     row's height math. */
+  .effect-tag.effect-tag-overflow {
+    width: var(--icon-size, 24px);
+    height: var(--icon-size, 24px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    background: rgba(255,255,255,0.22);
+  }
+
+  .status-line {
+    position: fixed;
+    bottom: 4px;
+    left: 8px;
+    font-size: 10px;
+    color: rgba(255,255,255,0.35);
+    font-family: monospace;
+  }
+
+  /* ------------------------------------------------------------------- */
+  /* Mission progress panel — ticket (score bar + all 3 points' tug-of-war  */
+  /* bars, always active), raid (round counter + boss health), koth (one   */
+  /* big tug-of-war bar for whichever point is currently active/rotating,  */
+  /* plus a captured-points pip row), payload/breach (one tile per point). */
+  /* Exactly one mode block is shown at a time, picked by mission.mode.    */
+  /* Sits top-center, in the same reserved clearance as #layout-controls.  */
+  /* ------------------------------------------------------------------- */
+  #mission-panel {
+    --scale: 1;
+    display: none;
+    position: fixed;
+    top: 52px;
+    left: 50%;
+    transform: translateX(-50%) scale(var(--scale));
+    transform-origin: top center;
+    z-index: 10;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    color: #fff;
+  }
+
+  body.admin-hidden #mission-panel { top: 16px; }
+
+  #mission-panel.visible { display: flex; }
+
+  /* Shown (even empty, with no live/demo data) while editing so it can be
+     dragged/resized ahead of time -- otherwise an operator setting up the
+     layout before any match exists would have nothing to grab. */
+  body.edit-mode #mission-panel { display: flex; }
+
+  /* Editable/draggable/resizable like the team panels -- see
+     freezePanelPosition's mission-panel handling for why the transform's
+     translateX(-50%) centering term gets dropped once it's frozen to an
+     absolute position. */
+  body.edit-mode #mission-panel {
+    outline: 1px dashed rgba(255,255,255,0.45);
+    outline-offset: 4px;
+  }
+
+  .mission-panel-handle {
+    display: none;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    text-align: center;
+    padding: 2px 6px;
+    border-radius: 3px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  }
+
+  body.edit-mode .mission-panel-handle {
+    display: block;
+    cursor: move;
+    user-select: none;
+    background: rgba(255,255,255,0.08);
+  }
+
+  /* Reuses the generic .resize-handle look/behavior (see the layout-editor
+     section below) -- just needs its own corner position since it isn't
+     inside a .attackers/.defenders panel. */
+  #mission-panel .resize-handle { right: -6px; }
+
+  body.hide-attackers #panel-attackers,
+  body.hide-defenders #panel-defenders,
+  body.hide-mission #mission-panel {
+    display: none !important;
+  }
+
+  /* Match/round timer -- universal across every mode (the engine's own
+     live countdown, see MissionProgressFeed.cpp), shown above whichever
+     mode-specific section is active. Hidden entirely at timer_state 0
+     (unset -- mission not yet initialized). */
+  #mission-timer {
+    display: none;
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  }
+  #mission-timer.visible { display: block; }
+  #mission-timer.overtime { color: #ff8a5c; }
+  #mission-timer.paused { color: #ffd54f; }
+
+  .mission-ticket-block { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .mission-ticket-row, .mission-raid-row { display: flex; align-items: center; gap: 10px; }
+
+  .mission-ticket-team {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  }
+  .mission-ticket-team.attackers { color: var(--color-atk); }
+  .mission-ticket-team.defenders { color: var(--color-def); }
+
+  .mission-ticket-bar {
+    position: relative;
+    width: 200px;
+    height: 14px;
+    border-radius: 4px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.35);
+    overflow: hidden;
+  }
+  .mission-ticket-bar-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    transition: width 150ms linear;
+  }
+  .mission-ticket-bar-fill.attackers { background: var(--color-atk); }
+  .mission-ticket-bar-fill.defenders { background: var(--color-def); }
+
+  .mission-ticket-count {
+    font-size: 11px;
+    min-width: 64px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+  }
+
+  /* Control's 3 capture points are always active simultaneously (unlike
+     koth's single rotating point), so this is a stack of small tug-of-war
+     bars underneath the existing attacker/defender score row -- one per
+     ATgMissionObjective, reusing .mission-tug-bar below at a smaller size. */
+  .mission-ticket-points-row { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
+  #mission-ticket-points .mission-tug-bar { width: 200px; height: 14px; }
+  #mission-ticket-points .mission-tug-label { font-size: 9px; }
+
+  /* Breach's 3 points are sequential, not simultaneous -- same stacked-bar
+     layout as ticket, but only the currently active/unlocked point gets a
+     live tug fill; the rest render via .mission-tug-bar.locked below. */
+  #mission-breach { display: flex; flex-direction: column; gap: 4px; }
+  #mission-breach .mission-tug-bar { width: 220px; height: 16px; }
+  #mission-breach .mission-tug-label { font-size: 10px; }
+
+  /* Shared tug-of-war bar widget -- koth's single active-point bar (big),
+     ticket's per-point bars (small), and breach's per-point bars all use
+     this. The bar is ALWAYS fully filled, never empty in the middle: at the
+     neutral midpoint (capture_pct 0.5 -- confirmed in CtrPointRotation.cpp's
+     SpawnPoint, which seeds new koth points at exactly half of
+     m_fTimeToCapture) it's exactly half red/half blue, matching the retail
+     HUD from mission start. As a team captures, their color's share grows
+     and the split point slides toward the other team's edge; a fully
+     captured point is 100% one color. See tugFractions(). */
+  .mission-tug-bar {
+    position: relative;
+    height: 22px;
+    border-radius: 4px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.35);
+    overflow: hidden;
+  }
+  /* Not yet contestable (breach point locked behind an earlier one) --
+     flat/dim, no red or blue, distinct from an active 50/50 neutral split. */
+  .mission-tug-bar.locked { opacity: 0.4; }
+  #mission-koth { flex-direction: column; align-items: center; gap: 6px; }
+  #mission-koth .mission-tug-bar { width: 280px; }
+  .mission-tug-fill-atk, .mission-tug-fill-def {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 0%;
+    transition: width 150ms linear;
+  }
+  .mission-tug-fill-atk { left: 0; background: var(--color-atk-bright); }
+  .mission-tug-fill-def { right: 0; background: var(--color-def-bright); }
+  .mission-tug-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    white-space: nowrap;
+  }
+
+  /* koth's "first to N points captured" rows -- Attackers/Defenders each get
+     points_to_win pips, filled solid once that many rounds/points are won.
+     Distinct from the per-point tug bars/payload segments elsewhere: those
+     track individual point capture state, this tracks overall match score,
+     same underlying field ticket's score bar already shows. */
+  .mission-points-rows { display: flex; flex-direction: column; gap: 4px; align-items: center; }
+  .mission-points-row { display: flex; align-items: center; gap: 6px; }
+  .mission-points-row-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    width: 74px;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  }
+  .mission-points-row-label.attackers { color: var(--color-atk); text-align: right; }
+  .mission-points-row-label.defenders { color: var(--color-def); text-align: left; }
+  .mission-point-pip {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.35);
+  }
+  .mission-point-pip.filled.attackers { background: var(--color-atk); }
+  .mission-point-pip.filled.defenders { background: var(--color-def); }
+
+  /* Raid/pve/superagent all stack their bar(s) vertically -- the koth-block
+     flex-direction bug (forgotten once already) is exactly why each of
+     these gets its own explicit rule rather than relying on inheritance. */
+  .mission-raid-block, .mission-pve-block, .mission-superagent-block {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .mission-raid-round {
+    font-size: 13px;
+    font-weight: 700;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+  }
+
+  /* Shared boss/friendly health-bar widget -- raid's hostile boss AND its
+     defended "friendly" NPC (distinct color), plus pve/superagent's solo
+     boss, all use this. Label shows "Name: HP / MaxHP" when a name resolved
+     (see ObjectiveNames.hpp), else just "HP / MaxHP". */
+  .mission-boss-bar {
+    position: relative;
+    width: 260px;
+    height: 16px;
+    border-radius: 4px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.35);
+    overflow: hidden;
+  }
+  .mission-boss-bar-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    background: #e53935;
+    transition: width 150ms linear;
+  }
+  .mission-boss-bar-fill.friendly { background: #4caf50; }
+  .mission-boss-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+  }
+
+  #mission-superagent-points { display: flex; flex-direction: column; gap: 4px; }
+  #mission-superagent-points .mission-tug-bar { width: 240px; height: 18px; }
+
+  /* payload -- ONE connected pill divided into N equal segments (one per
+     push checkpoint, usually 3), not N separate widgets: a captured segment
+     (attackers already pushed past it) renders solid dark-red and dimmed; a
+     not-yet-reached segment (still defender-occupied) renders solid
+     dark-blue and dimmed; the current active segment renders a live
+     tug-of-war split (bright red/blue, same math as .mission-tug-bar) inside
+     its own slice. AVA_THEFT-style maps that only have 1 checkpoint just
+     render a single segment -- no special-casing needed, the width is
+     always 100/N%. */
+  .mission-payload-bar {
+    position: relative;
+    display: flex;
+    width: 300px;
+    height: 24px;
+    border-radius: 4px;
+    background: rgba(12, 14, 20, 0.72);
+    border: 1px solid rgba(255,255,255,0.35);
+    overflow: hidden;
+  }
+  .mission-payload-segment {
+    position: relative;
+    height: 100%;
+    border-right: 1px solid rgba(0,0,0,0.5);
+  }
+  .mission-payload-segment:last-child { border-right: none; }
+  /* Reuses .mission-tug-fill-atk/-def's absolute left/right positioning --
+     only the color is overridden per state (bright for the live segment,
+     dark/dimmed for captured or not-yet-reached ones). */
+  .mission-payload-segment .mission-tug-fill-atk,
+  .mission-payload-segment .mission-tug-fill-def {
+    transition: width 150ms linear;
+  }
+  .mission-payload-segment.captured .mission-tug-fill-atk,
+  .mission-payload-segment.captured .mission-tug-fill-def {
+    background: var(--color-atk-dark);
+  }
+  .mission-payload-segment.pending .mission-tug-fill-atk,
+  .mission-payload-segment.pending .mission-tug-fill-def {
+    background: var(--color-def-dark);
+  }
+
+  /* ------------------------------------------------------------------- */
+  /* Layout editor (drag / resize) — only interactive in edit mode.       */
+  /* ------------------------------------------------------------------- */
+
+  #layout-controls {
+    position: fixed;
+    top: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 92vw;
+    gap: 6px;
+    font-family: monospace;
+  }
+
+  #layout-controls button,
+  #layout-controls select {
+    font-size: 11px;
+    padding: 4px 10px;
+    background: rgba(20,20,25,0.82);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.3);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  #layout-controls button.active {
+    background: rgba(76,175,80,0.85);
+    border-color: rgba(255,255,255,0.6);
+  }
+
+  body.edit-mode .team-panel {
+    outline: 1px dashed rgba(255,255,255,0.45);
+    outline-offset: 4px;
+  }
+
+  body.edit-mode .team-label {
+    cursor: move;
+    user-select: none;
+    background: rgba(255,255,255,0.08);
+  }
+
+  .resize-handle {
+    display: none;
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    bottom: -6px;
+    background: rgba(255,255,255,0.55);
+    border: 1px solid rgba(0,0,0,0.4);
+    border-radius: 3px;
+    cursor: nwse-resize;
+  }
+
+  /* Inner-facing corner for each panel — attackers is left-anchored so its
+     handle sits bottom-right (toward screen center); defenders is
+     right-anchored so its handle needs to sit bottom-LEFT instead, or it
+     ends up pinned against the outer edge of the screen, barely reachable. */
+  .attackers .resize-handle { right: -6px; }
+  .defenders .resize-handle { left: -6px; cursor: nesw-resize; }
+
+  .team-panel { position: relative; }
+  body.edit-mode .resize-handle { display: block; }
+
+  #resize-both {
+    cursor: ew-resize;
+    display: none;
+  }
+  body.edit-mode #resize-both { display: inline-block; }
+
+  /* ------------------------------------------------------------------- */
+  /* Config strip — instance + icon-folder selection. Lives in the same    */
+  /* reserved top clearance as #layout-controls (see #root's padding-top), */
+  /* just left-anchored instead of centered, so a broadcast crop removing  */
+  /* that whole strip takes this with it too.                             */
+  /* ------------------------------------------------------------------- */
+  #overlay-settings {
+    position: fixed;
+    top: 6px;
+    left: 6px;
+    z-index: 9999;
+    display: flex;
+    gap: 6px;
+    font-family: monospace;
+  }
+
+  #overlay-settings select,
+  #overlay-settings input {
+    font-size: 11px;
+    padding: 4px 6px;
+    background: rgba(20,20,25,0.82);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.3);
+    border-radius: 4px;
+  }
+
+  #overlay-settings input { width: 340px; }
+
+  /* Admin bar hide toggle (press H) -- for putting this page straight into
+     an OBS Browser Source. Cropping the OBS source to dodge the admin strip
+     is fragile (any layout change shifts the "safe" boundary); this instead
+     removes it from the DOM's rendered layout entirely, so the source can
+     just show the whole page. State persists in localStorage so it survives
+     OBS reloading the source (scene switches, "refresh on activate", etc).
+     There's deliberately no visible button for this -- if there were, it'd
+     have nothing to click once it's already hidden. */
+  body.admin-hidden #overlay-settings,
+  body.admin-hidden #layout-controls {
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="overlay-settings">
+  <select id="instance-select" title="Only instances an active spectator is currently watching are listed">
+    <option value="">Instance…</option>
+  </select>
+  <input id="icons-path-input" type="text" placeholder="ICONS folder (contains CLASSES/EFFECTS/SKILLS subfolders)" />
+</div>
+
+<div id="layout-controls">
+  <button id="edit-toggle">Edit Layout</button>
+  <button id="reset-layout">Reset Layout</button>
+  <button id="hide-attackers-toggle"></button>
+  <button id="hide-defenders-toggle"></button>
+  <button id="hide-mission-toggle"></button>
+  <button id="swap-colors-toggle" title="QoL toggle for PVE spectating where attacker/defender framing doesn't map cleanly -- swaps every team color (labels, bars, pips) without touching any game logic."></button>
+  <button id="demo-toggle"></button>
+  <select id="demo-mission-select" title="Which mission-progress demo to show while Demo Mode is on">
+    <option value="auto">Demo: Auto-cycle</option>
+    <option value="ticket">Demo: Ticket/Control</option>
+    <option value="raid">Demo: Raid</option>
+    <option value="pve">Demo: PvE</option>
+    <option value="superagent">Demo: Super Agent</option>
+    <option value="koth">Demo: KOTH/Scramble</option>
+    <option value="breach">Demo: Breach</option>
+    <option value="payload">Demo: Payload/Push</option>
+  </select>
+  <button id="hp-toggle" title="In-game, players only ever see the health bar, never a number -- off by default to match."></button>
+  <button id="power-toggle" title="In-game, players only ever see the power/energy bar, never a number -- off by default to match."></button>
+  <button id="resize-both" title="Drag left/right to resize both panels together">⇔ Resize Both</button>
+</div>
+
+<div id="mission-panel">
+  <div class="mission-panel-handle">⠿ Mission Info</div>
+  <div id="mission-timer"></div>
+  <div id="mission-ticket" class="mission-ticket-block">
+    <div class="mission-ticket-row">
+      <div class="mission-ticket-team attackers">ATK</div>
+      <div class="mission-ticket-bar"><div class="mission-ticket-bar-fill attackers" id="mission-ticket-fill-atk"></div></div>
+      <div class="mission-ticket-count" id="mission-ticket-count-atk"></div>
+      <div class="mission-ticket-count" id="mission-ticket-count-def"></div>
+      <div class="mission-ticket-bar"><div class="mission-ticket-bar-fill defenders" id="mission-ticket-fill-def"></div></div>
+      <div class="mission-ticket-team defenders">DEF</div>
+    </div>
+    <div id="mission-ticket-points" class="mission-ticket-points-row"></div>
+  </div>
+  <div id="mission-raid" class="mission-raid-block">
+    <div class="mission-raid-round" id="mission-raid-round"></div>
+    <div class="mission-boss-bar">
+      <div class="mission-boss-bar-fill" id="mission-boss-fill"></div>
+      <div class="mission-boss-label" id="mission-boss-label"></div>
+    </div>
+    <div class="mission-boss-bar" id="mission-friendly-bar">
+      <div class="mission-boss-bar-fill friendly" id="mission-friendly-fill"></div>
+      <div class="mission-boss-label" id="mission-friendly-label"></div>
+    </div>
+  </div>
+  <div id="mission-pve" class="mission-pve-block">
+    <div class="mission-boss-bar">
+      <div class="mission-boss-bar-fill" id="mission-pve-boss-fill"></div>
+      <div class="mission-boss-label" id="mission-pve-boss-label"></div>
+    </div>
+  </div>
+  <div id="mission-superagent" class="mission-superagent-block">
+    <div class="mission-boss-bar">
+      <div class="mission-boss-bar-fill" id="mission-superagent-boss-fill"></div>
+      <div class="mission-boss-label" id="mission-superagent-boss-label"></div>
+    </div>
+    <div id="mission-superagent-points"></div>
+  </div>
+  <div id="mission-koth" class="mission-koth-block">
+    <div class="mission-tug-bar" id="mission-koth-tugbar">
+      <div class="mission-tug-fill-atk" id="mission-koth-fill-atk"></div>
+      <div class="mission-tug-fill-def" id="mission-koth-fill-def"></div>
+      <div class="mission-tug-label" id="mission-koth-label"></div>
+    </div>
+    <div class="mission-points-rows">
+      <div class="mission-points-row">
+        <div class="mission-points-row-label attackers">Attackers</div>
+        <div id="mission-koth-pips-atk" class="mission-points-row"></div>
+      </div>
+      <div class="mission-points-row">
+        <div class="mission-points-row-label defenders">Defenders</div>
+        <div id="mission-koth-pips-def" class="mission-points-row"></div>
+      </div>
+    </div>
+  </div>
+  <div id="mission-breach"></div>
+  <div id="mission-payload" class="mission-payload-bar"></div>
+  <div class="resize-handle" data-side="left"></div>
+</div>
+
+<div id="root">
+  <div class="team-panel attackers" id="panel-attackers">
+    <div class="team-label">Attackers</div>
+    <div class="cards-container" id="cards-attackers"></div>
+    <div class="resize-handle" data-side="left"></div>
+  </div>
+  <div class="team-panel defenders" id="panel-defenders">
+    <div class="team-label">Defenders</div>
+    <div class="cards-container" id="cards-defenders"></div>
+    <div class="resize-handle" data-side="right"></div>
+  </div>
+</div>
+<div class="status-line" id="status">connecting…</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Config — edit these as fallback defaults for first load on a machine that
+// has never set its own values yet. INSTANCE_ID and ICONS_ROOT_PATH are both
+// overridable at runtime via the settings bar (top-left) and persisted in
+// localStorage from then on -- this page is meant to be hosted somewhere the
+// broadcast operator can't edit the file itself, so both need a config path
+// that doesn't require touching this HTML.
+// ---------------------------------------------------------------------------
+// Same-origin by default: this page is meant to be served by
+// docker/spectator-overlay/overlay_proxy.py, which forwards /overlay* to the
+// control server and attaches the secret token server-side (OVERLAY_TOKEN
+// env var) so it never appears in this file or in any browser-visible URL.
+// For a direct-to-control-server setup on a private network, point
+// OVERLAY_BASE_URL at "http://<host>:<overlay_http_port>/overlay" and set
+// OVERLAY_TOKEN below to the overlay_token from control-server.json.
+const OVERLAY_BASE_URL      = "/overlay";
+const OVERLAY_INSTANCES_URL = OVERLAY_BASE_URL + "/instances";
+const OVERLAY_BUILDS_URL    = OVERLAY_BASE_URL + "/builds";
+const OVERLAY_TOKEN         = "";  // leave empty when served through the proxy
+const DEFAULT_INSTANCE_ID   = 0;   // 0 = none selected yet -- pick one from the dropdown
+// One shared ICONS folder with 3 fixed subfolders -- CLASSES/EFFECTS/SKILLS
+// -- rather than a separate path per icon kind. Shared with
+// skill-tree-overlay.html via the same localStorage key (same origin), so
+// setting it once here covers both pages.
+const DEFAULT_ICONS_ROOT_PATH = "ICONS/";
+const POLL_MS                = 300;
+const INSTANCE_LIST_POLL_MS  = 5000;
+// Builds don't change mid-match outside a loadout-profile swap, so this
+// polls far slower than the 300ms health/effects loop -- see
+// OverlayHttpServer's GET /overlay/builds and SkillTreeCatalog.hpp for why
+// bundling this into the fast poll would mean 2 DB queries x N players
+// every 300ms on the control server's single shared thread.
+const BUILDS_POLL_MS         = 6000;
+
+// player_key -> {balanced, tree1, tree2, tree1_name, tree2_name}, refreshed
+// by pollBuilds() on its own slower cadence and read (not fetched) by the
+// main render loop -- see poll()/renderTeam().
+let buildCache = {};
+
+// The raw "123 / 1300" HP number isn't something a player ever sees in-game
+// (only the bar itself is) -- hidden by default, toggleable in
+// #layout-controls for admin/testing use. The health-pill-fill bar's width
+// is computed from p.health/p.health_max regardless of this flag; only the
+// text label is affected. The build ("P/T1/T2") notation takes its place in
+// that text slot when this is off.
+const SHOW_HP_KEY = "spectatorOverlayShowHpNumber_v1";
+let showHpNumber = localStorage.getItem(SHOW_HP_KEY) === "1";
+
+// Same reasoning as SHOW_HP_KEY above, for the power/energy bar's own
+// current/max label -- off by default, toggleable in #layout-controls.
+const SHOW_POWER_KEY = "spectatorOverlayShowPowerNumber_v1";
+let showPowerNumber = localStorage.getItem(SHOW_POWER_KEY) === "1";
+
+// Max icons a single player's card ever shows -- anything beyond this
+// collapses into a "+N" badge instead of growing the card (and therefore the
+// whole column below it) taller. See .effect-tag-overflow.
+const MAX_VISIBLE_EFFECTS = 6;
+
+const INSTANCE_KEY   = "spectatorOverlayInstanceId_v1";
+const ICONS_PATH_KEY = "spectatorOverlayIconsRootPath_v1"; // shared with skill-tree-overlay.html
+
+let INSTANCE_ID = Number(localStorage.getItem(INSTANCE_KEY)) || DEFAULT_INSTANCE_ID;
+let ICONS_ROOT_PATH = localStorage.getItem(ICONS_PATH_KEY) || DEFAULT_ICONS_ROOT_PATH;
+
+// profile_id (GameTypes.h GA_G::PROFILE_ID_*) -> class icon filename.
+// Class icons are keyed by NAME, not id -- profile_id and an effect_group_id
+// or skill icon_id could otherwise collide on the same "<id>.png" file in a
+// shared folder tree.
+const PROFILE_ID_TO_CLASS_ICON = {
+  567: "Medic.png",
+  680: "Assault.png",
+  681: "Recon.png",
+  679: "Robotics.png",
+};
+
+// Set true to generate a fake 3v3 match locally instead of calling the
+// server -- lets you rehearse layout/positioning (and, with a generous
+// effect count, icon-overflow/wrapping) without a live match. Toggle it live
+// with the "Demo Mode" button too. Off by default -- a real broadcast
+// operator wants refreshInstanceList's auto-pick (see below) to take over
+// as soon as a real instance appears, not a page stuck showing fake players.
+let DEMO_MODE = false;
+
+// Which mission-progress demo generateDemoMission() shows -- "auto" cycles
+// through all seven every 6s (the default, see the mode-select dropdown
+// next to the Demo Mode button); any other value pins it to that one mode
+// so an operator can rehearse a specific mode's layout without waiting for
+// the cycle to come back around to it.
+let DEMO_MISSION_MODE = "auto";
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function healthColor(pct) {
+  if (pct > 0.5) return "#4caf50";
+  if (pct > 0.25) return "#ffb300";
+  return "#e53935";
+}
+
+function effectTagElement(id) {
+  const tag = document.createElement("div");
+  tag.className = "effect-tag effect-tag-icon";
+
+  const img = document.createElement("img");
+  img.src = ICONS_ROOT_PATH + "EFFECTS/" + id + ".png";
+  img.alt = "#" + id;
+  img.title = "#" + id;
+  // Icon file missing locally -- fall back to a plain "#id" tag instead of
+  // showing a broken image.
+  img.onerror = () => {
+    tag.classList.remove("effect-tag-icon");
+    tag.textContent = "#" + id;
+  };
+  tag.appendChild(img);
+  return tag;
+}
+
+function overflowTagElement(count) {
+  const tag = document.createElement("div");
+  tag.className = "effect-tag effect-tag-overflow";
+  tag.textContent = "+" + count;
+  tag.title = count + " more active effect" + (count === 1 ? "" : "s");
+  return tag;
+}
+
+// Class icon -- a SEPARATE id space (profile_id) and folder (CLASS_ICON_BASE_PATH)
+// from effect icons. profile_id 0 (unknown/unset) skips the image entirely
+// rather than requesting "0.png".
+function classIconElement(profileId) {
+  const wrap = document.createElement("div");
+  wrap.className = "class-icon";
+  const filename = PROFILE_ID_TO_CLASS_ICON[profileId];
+  if (!filename) return wrap;
+
+  const img = document.createElement("img");
+  img.src = ICONS_ROOT_PATH + "CLASSES/" + filename;
+  img.alt = img.title = filename.replace(".png", "");
+  img.onerror = () => { img.remove(); };
+  wrap.appendChild(img);
+  return wrap;
+}
+
+// Canonical class ordering shared by BOTH teams (Assault, Medic, Robotics,
+// Recon) so a given class occupies the same row position on the attacker
+// and defender sides -- keyed by profile_id (not name) since that's what
+// player records carry. Unknown/missing profile_id sorts last but keeps
+// its relative order (Array#sort is stable).
+const CLASS_SORT_ORDER = [680, 567, 679, 681]; // Assault, Medic, Robotics, Recon
+
+function sortByClassOrder(players) {
+  return players.slice().sort((a, b) => {
+    const ai = CLASS_SORT_ORDER.indexOf(a.profile_id);
+    const bi = CLASS_SORT_ORDER.indexOf(b.profile_id);
+    return (ai < 0 ? CLASS_SORT_ORDER.length : ai) - (bi < 0 ? CLASS_SORT_ORDER.length : bi);
+  });
+}
+
+// Persistent per-container card state, keyed by player_key -- reused across
+// polls instead of being torn down and rebuilt from scratch every tick.
+// Recreating <img> elements (class icons, effect icons) on every 300ms poll
+// is what was causing constant flicker in OBS's Browser Source (CEF
+// repaints on every new <img>, even a cache-hit one, far more visibly than
+// a normal browser tab does) -- keeping the same DOM/img nodes alive and
+// only touching the fields that actually changed eliminates that entirely.
+// See buildCard/updateCard below; renderTeam just reconciles against this.
+const teamCardState = { "cards-attackers": new Map(), "cards-defenders": new Map() };
+
+function buildCard(p) {
+  const card = document.createElement("div");
+  card.className = "player-card";
+
+  const row = document.createElement("div");
+  row.className = "player-row";
+  const classIconWrap = classIconElement(p.profile_id);
+  row.appendChild(classIconWrap);
+
+  const pill = document.createElement("div");
+  pill.className = "health-pill";
+  const fill = document.createElement("div");
+  fill.className = "health-pill-fill";
+  const name = document.createElement("div");
+  name.className = "health-pill-name";
+  const hpText = document.createElement("div");
+  hpText.className = "health-pill-hp";
+  pill.appendChild(fill);
+  pill.appendChild(name);
+  pill.appendChild(hpText);
+  row.appendChild(pill);
+  card.appendChild(row);
+
+  const powerPill = document.createElement("div");
+  powerPill.className = "power-pill";
+  const powerTrack = document.createElement("div");
+  powerTrack.className = "power-pill-track";
+  const powerFill = document.createElement("div");
+  powerFill.className = "power-pill-fill";
+  const powerText = document.createElement("div");
+  powerText.className = "power-pill-text";
+  powerTrack.appendChild(powerFill);
+  powerPill.appendChild(powerTrack);
+  powerPill.appendChild(powerText);
+  card.appendChild(powerPill);
+
+  // Always present, even with zero active effects — its min-height (see
+  // CSS) reserves the space either way, so a buff appearing/disappearing
+  // never shifts the pill above it up and down.
+  const effectsRow = document.createElement("div");
+  effectsRow.className = "effects-row";
+  card.appendChild(effectsRow);
+
+  return {
+    card, classIconWrap, fill, name, hpText, powerFill, powerText, effectsRow,
+    lastProfileId: p.profile_id, // classIconWrap above already matches this
+    lastEffectKey: null,
+  };
+}
+
+function updateCard(state, p) {
+  const pct = p.health_max > 0 ? Math.max(0, Math.min(1, p.health / p.health_max)) : 0;
+
+  // Class practically never changes mid-match (only the loadout slot does),
+  // but handle it correctly rather than assuming -- rebuilds just the icon,
+  // not the whole card.
+  if (state.lastProfileId !== p.profile_id) {
+    const fresh = classIconElement(p.profile_id);
+    state.classIconWrap.replaceWith(fresh);
+    state.classIconWrap = fresh;
+    state.lastProfileId = p.profile_id;
+  }
+
+  state.fill.style.width = (pct * 100) + "%";
+  state.fill.style.backgroundColor = healthColor(pct);
+  state.name.textContent = p.player_name || "(unknown)";
+
+  const powerPct = p.power_max > 0 ? Math.max(0, Math.min(1, p.power / p.power_max)) : 0;
+  state.powerFill.style.width = (powerPct * 100) + "%";
+  // Same off-by-default reasoning as SHOW_HP_KEY below -- players only ever
+  // see the bar in-game, never a number.
+  state.powerText.textContent = showPowerNumber
+    ? Math.round(p.power) + " / " + Math.round(p.power_max) : "";
+
+  // Raw HP number is off by default (see SHOW_HP_KEY) -- the bar itself
+  // (fill.style.width above) already conveys health the same way it does
+  // in-game. When off, the "P/T1/T2" build notation (see
+  // SkillTreeCatalog.hpp) occupies this slot alone instead of trailing
+  // after the number. Demo mode sets p.build directly (see DEMO_ROSTER);
+  // real data comes from buildCache, refreshed on its own slower cadence
+  // by pollBuilds() rather than every 300ms tick -- see BUILDS_POLL_MS.
+  const build = p.build || buildCache[p.player_key];
+  const parts = [];
+  if (showHpNumber) parts.push(p.health + " / " + p.health_max);
+  if (build) parts.push(build.balanced + "/" + build.tree1 + "/" + build.tree2);
+  state.hpText.textContent = parts.join("   ");
+
+  // Effect icons are the expensive/flicker-prone part -- only touch the DOM
+  // here if the actual set of active ids changed since last render. Capped
+  // at MAX_VISIBLE_EFFECTS + an overflow badge so a heavily-buffed player
+  // can't grow their card (and shove every card below them down, possibly
+  // off-frame) without bound.
+  const ids = p.effect_ids || [];
+  const effectKey = ids.join(",");
+  if (state.lastEffectKey !== effectKey) {
+    state.effectsRow.innerHTML = "";
+    ids.slice(0, MAX_VISIBLE_EFFECTS).forEach(id => state.effectsRow.appendChild(effectTagElement(id)));
+    if (ids.length > MAX_VISIBLE_EFFECTS) {
+      state.effectsRow.appendChild(overflowTagElement(ids.length - MAX_VISIBLE_EFFECTS));
+    }
+    state.lastEffectKey = effectKey;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mission progress panel — ticket (score bar + all-3-points-active tug bars),
+// raid (round + boss health), koth (one active-point tug bar + captured-
+// points pips), payload/breach (one tile per point, unchanged). Exactly one
+// mode block is visible at a time, picked by mission.mode. Persistent DOM
+// nodes are keyed by ARRAY POSITION, not o.id/o.priority -- KOTH/Scramble's
+// rotation pool (see CtrPointRotation.cpp's SpawnPoint) deliberately gives
+// every point the same nObjectiveId (345, the mesh asset id) and the same
+// nPriority (1, "all equal -> random rotation"), so keying by either field
+// collapsed all of a match's points onto one shared/recycled DOM element.
+// The server-side array order is stable for the life of a match (points are
+// spawned once at Init, never re-sorted), so position is the one identity
+// that's actually unique per point in every mode.
+// ---------------------------------------------------------------------------
+const missionPanel           = document.getElementById("mission-panel");
+const missionTimer           = document.getElementById("mission-timer");
+const missionTicket          = document.getElementById("mission-ticket");
+const missionTicketFillAtk   = document.getElementById("mission-ticket-fill-atk");
+const missionTicketFillDef   = document.getElementById("mission-ticket-fill-def");
+const missionTicketCountAtk  = document.getElementById("mission-ticket-count-atk");
+const missionTicketCountDef  = document.getElementById("mission-ticket-count-def");
+const missionTicketPoints    = document.getElementById("mission-ticket-points");
+const missionRaid            = document.getElementById("mission-raid");
+const missionRaidRound       = document.getElementById("mission-raid-round");
+const missionBossFill        = document.getElementById("mission-boss-fill");
+const missionBossLabel       = document.getElementById("mission-boss-label");
+const missionFriendlyBar     = document.getElementById("mission-friendly-bar");
+const missionFriendlyFill    = document.getElementById("mission-friendly-fill");
+const missionFriendlyLabel   = document.getElementById("mission-friendly-label");
+const missionPve             = document.getElementById("mission-pve");
+const missionPveBossFill     = document.getElementById("mission-pve-boss-fill");
+const missionPveBossLabel    = document.getElementById("mission-pve-boss-label");
+const missionSuperagent           = document.getElementById("mission-superagent");
+const missionSuperagentBossFill   = document.getElementById("mission-superagent-boss-fill");
+const missionSuperagentBossLabel  = document.getElementById("mission-superagent-boss-label");
+const missionSuperagentPoints     = document.getElementById("mission-superagent-points");
+const missionKoth            = document.getElementById("mission-koth");
+const missionKothFillAtk     = document.getElementById("mission-koth-fill-atk");
+const missionKothFillDef     = document.getElementById("mission-koth-fill-def");
+const missionKothLabel       = document.getElementById("mission-koth-label");
+const missionKothPipsAtk     = document.getElementById("mission-koth-pips-atk");
+const missionKothPipsDef     = document.getElementById("mission-koth-pips-def");
+const missionBreach          = document.getElementById("mission-breach");
+const missionPayload         = document.getElementById("mission-payload");
+
+// capture_pct is m_fCurrCaptureTime/m_fTimeToCapture, a single 0..1 "tug"
+// value with 0.5 as the neutral midpoint (CtrPointRotation.cpp's SpawnPoint
+// explicitly seeds new koth points at half of m_fTimeToCapture). The bar is
+// ALWAYS fully filled -- attacker(red) occupies the share up to the split
+// point, defender(blue) occupies the rest, so at pct=0.5 it's an even
+// half-red/half-blue split (matching the retail HUD from mission start),
+// and as a team captures, the split slides toward the OTHER team's edge
+// until that team's color fills the whole bar. CONFIRMED live (2026-07-30
+// Scramble + Control tests): pct trending toward 1 = attacker progress,
+// toward 0 = defender progress -- the opposite of this file's original
+// guess, which showed attacker captures filling blue instead of red.
+function tugFractions(pct) {
+  const p = Math.max(0, Math.min(1, pct));
+  return { atk: p, def: 1 - p };
+}
+
+// Prefer the friendly name the server resolved (ObjectiveNames.hpp, joining
+// nObjectiveId through asm_data_set_objectives/msg_translations) -- but
+// custom-spawned pools (koth's rotation points, and apparently at least some
+// Payload maps) reuse ONE nObjectiveId across every point, so if multiple
+// points in THIS SAME array share a name, showing it would look like a bug
+// (every point labeled identically). Falls back to "Point N" for all of
+// them in that case rather than trusting a duplicate name.
+function pointLabels(points) {
+  const counts = new Map();
+  points.forEach(o => {
+    if (!o.name) return;
+    counts.set(o.name, (counts.get(o.name) || 0) + 1);
+  });
+  return points.map((o, idx) => (o.name && counts.get(o.name) === 1) ? o.name : "Point " + (idx + 1));
+}
+
+// TgGame.ETgMissionTimerState (TGMTS_*) -- see IpcProtocol.hpp's
+// MSG_MISSION_PROGRESS_SNAPSHOT doc. 0/4 (unset/complete) get no label;
+// running (2) and custom/round (6) show plain time, no prefix needed.
+const MISSION_TIMER_STATE_LABEL = { 1: "Setup", 3: "Overtime", 5: "Paused" };
+
+function formatMissionTime(totalSeconds) {
+  const s = Math.max(0, Math.round(totalSeconds || 0));
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m + ":" + String(sec).padStart(2, "0");
+}
+
+// Universal across every mode -- always updated regardless of which mode-
+// specific section is showing (see updateMissionPanel).
+function updateMissionTimer(mission) {
+  const state = mission.mission_timer_state || 0;
+  if (state === 0) {
+    missionTimer.classList.remove("visible", "overtime", "paused");
+    return;
+  }
+  missionTimer.classList.add("visible");
+  missionTimer.classList.toggle("overtime", state === 3);
+  missionTimer.classList.toggle("paused", state === 5);
+  if (state === 4) {
+    missionTimer.textContent = "Match Complete";
+    return;
+  }
+  const label = MISSION_TIMER_STATE_LABEL[state];
+  missionTimer.textContent = (label ? label + ": " : "") + formatMissionTime(mission.mission_remaining_seconds);
+}
+
+const missionPayloadSegments = new Map(); // array position -> {el, fillAtk, fillDef}
+
+function ensurePayloadSegment(position) {
+  let entry = missionPayloadSegments.get(position);
+  if (!entry) {
+    const el = document.createElement("div");
+    el.className = "mission-payload-segment";
+    const fillAtk = document.createElement("div");
+    fillAtk.className = "mission-tug-fill-atk";
+    const fillDef = document.createElement("div");
+    fillDef.className = "mission-tug-fill-def";
+    el.appendChild(fillAtk);
+    el.appendChild(fillDef);
+    entry = { el, fillAtk, fillDef };
+    missionPayloadSegments.set(position, entry);
+  }
+  // appendChild on a node already in the document just MOVES it -- same
+  // move-not-recreate reasoning as renderTeam's card reordering.
+  missionPayload.appendChild(entry.el);
+  return entry;
+}
+
+// Payload's push checkpoints are sequential like breach, but rendered as ONE
+// connected pill split into N equal-width segments rather than N separate
+// bars: a segment before the active one is fully captured (solid dark-red,
+// dimmed), the active one gets a live tug-of-war split (bright, same math
+// as .mission-tug-bar), and segments after it are still defender-held
+// (solid dark-blue, dimmed). N is whatever mission.objectives.length is --
+// AVA_THEFT-style 1-checkpoint maps just render a single full-width segment.
+function renderPayloadBar(points) {
+  const activeIdx = points.findIndex(o => o.active && !o.locked);
+  const seen = new Set();
+  points.forEach((o, idx) => {
+    seen.add(idx);
+    const entry = ensurePayloadSegment(idx);
+    entry.el.style.width = (100 / points.length) + "%";
+    const isActive = idx === activeIdx;
+    const isCaptured = activeIdx >= 0 && idx < activeIdx;
+    entry.el.classList.toggle("captured", isCaptured);
+    entry.el.classList.toggle("pending", !isActive && !isCaptured);
+    if (isActive) {
+      const frac = tugFractions(o.capture_pct != null ? o.capture_pct : 0.5);
+      entry.fillAtk.style.width = (frac.atk * 100) + "%";
+      entry.fillDef.style.width = (frac.def * 100) + "%";
+    } else if (isCaptured) {
+      entry.fillAtk.style.width = "100%";
+      entry.fillDef.style.width = "0%";
+    } else {
+      entry.fillAtk.style.width = "0%";
+      entry.fillDef.style.width = "100%";
+    }
+  });
+  for (const [pos, entry] of missionPayloadSegments) {
+    if (!seen.has(pos)) { entry.el.remove(); missionPayloadSegments.delete(pos); }
+  }
+}
+
+// Persistent per-position tug-bar elements, one Map per container -- ticket's
+// simultaneously-active points and breach's sequential ones each get their
+// own (a shared Map would collide position 0 of one mode with position 0 of
+// another when switching modes mid-session). Move-not-recreate on every
+// update (appendChild on an already-attached node just moves it) so the
+// CSS width transition never resets mid-animation.
+function ensureTugBar(barMap, container, position) {
+  let entry = barMap.get(position);
+  if (!entry) {
+    const el = document.createElement("div");
+    el.className = "mission-tug-bar";
+    const fillAtk = document.createElement("div");
+    fillAtk.className = "mission-tug-fill-atk";
+    const fillDef = document.createElement("div");
+    fillDef.className = "mission-tug-fill-def";
+    const label = document.createElement("div");
+    label.className = "mission-tug-label";
+    el.appendChild(fillAtk);
+    el.appendChild(fillDef);
+    el.appendChild(label);
+    entry = { el, fillAtk, fillDef, label };
+    barMap.set(position, entry);
+  }
+  container.appendChild(entry.el);
+  return entry;
+}
+
+// Renders a stack of tug bars, one per point in priority order. A point that
+// isn't currently active/unlocked (breach's not-yet-reached points; never
+// true for ticket's always-active 3) renders as a dim, colorless "locked"
+// bar instead of a live 50/50-or-shifted split -- there's nothing to tug
+// over yet since it isn't contestable.
+function renderTugBarStack(container, barMap, points) {
+  const labels = pointLabels(points);
+  const seen = new Set();
+  points.forEach((o, idx) => {
+    seen.add(idx);
+    const entry = ensureTugBar(barMap, container, idx);
+    const isLive = o.active && !o.locked;
+    entry.el.classList.toggle("locked", !isLive);
+    if (isLive) {
+      const frac = tugFractions(o.capture_pct != null ? o.capture_pct : 0.5);
+      entry.fillAtk.style.width = (frac.atk * 100) + "%";
+      entry.fillDef.style.width = (frac.def * 100) + "%";
+      entry.label.textContent = labels[idx];
+    } else {
+      entry.fillAtk.style.width = "0%";
+      entry.fillDef.style.width = "0%";
+      entry.label.textContent = labels[idx] + " (locked)";
+    }
+  });
+  for (const [pos, entry] of barMap) {
+    if (!seen.has(pos)) { entry.el.remove(); barMap.delete(pos); }
+  }
+}
+
+const missionTicketTugBars     = new Map(); // array position -> {el, fillAtk, fillDef, label}
+const missionBreachTugBars     = new Map();
+const missionSuperagentTugBars = new Map();
+
+// koth's "first to points_to_win" pip row -- cheap plain divs with no images
+// and no fill-transition to preserve, so a full rebuild each poll is fine
+// (unlike the tug bars/objective pips above, nothing here benefits from
+// persistent nodes).
+function renderPointsPips(container, wonCount, total, teamClass) {
+  container.innerHTML = "";
+  for (let i = 0; i < total; i++) {
+    const pip = document.createElement("div");
+    pip.className = "mission-point-pip" + (i < wonCount ? " filled " + teamClass : "");
+    container.appendChild(pip);
+  }
+}
+
+function updateMissionPanel(mission) {
+  if (!mission || !mission.mode) {
+    missionPanel.classList.remove("visible");
+    return;
+  }
+  missionPanel.classList.add("visible");
+  updateMissionTimer(mission);
+  missionTicket.style.display = "none";
+  missionRaid.style.display = "none";
+  missionPve.style.display = "none";
+  missionSuperagent.style.display = "none";
+  missionKoth.style.display = "none";
+  missionBreach.style.display = "none";
+  missionPayload.style.display = "none";
+
+  // "Name: HP / MaxHP" when a friendly name resolved server-side, else just
+  // "HP / MaxHP" -- shared by raid's boss/friendly bars and pve/superagent's
+  // boss bar. "" (bar hidden/empty) when maxHp is 0 (no such bot on this map).
+  function bossLabelText(name, hp, maxHp) {
+    if (maxHp <= 0) return "";
+    return (name ? name + ": " : "") + hp + " / " + maxHp;
+  }
+
+  if (mission.mode === "ticket") {
+    missionTicket.style.display = "flex";
+    const toWin = mission.points_to_win > 0 ? mission.points_to_win : 1;
+    const atkPct = Math.max(0, Math.min(1, mission.attacker_points / toWin));
+    const defPct = Math.max(0, Math.min(1, mission.defender_points / toWin));
+    missionTicketFillAtk.style.width = (atkPct * 100) + "%";
+    missionTicketFillDef.style.width = (defPct * 100) + "%";
+    missionTicketCountAtk.textContent = mission.attacker_points + " / " + mission.points_to_win;
+    missionTicketCountDef.textContent = mission.defender_points + " / " + mission.points_to_win;
+
+    // Control's capture points are always active -- one small tug bar per
+    // point, in priority order (position-keyed, see the file-level comment).
+    const points = (mission.objectives || []).slice().sort((a, b) => a.priority - b.priority);
+    renderTugBarStack(missionTicketPoints, missionTicketTugBars, points);
+  } else if (mission.mode === "raid") {
+    missionRaid.style.display = "flex";
+    // Shown as "Wave" on the overlay -- same underlying round counter.
+    missionRaidRound.textContent = "Wave " + mission.round_current + " / " + mission.round_max;
+
+    const bossPct = mission.boss_health_max > 0
+      ? Math.max(0, Math.min(1, mission.boss_health / mission.boss_health_max)) : 0;
+    missionBossFill.style.width = (bossPct * 100) + "%";
+    missionBossLabel.textContent = bossLabelText(mission.boss_name, mission.boss_health, mission.boss_health_max);
+
+    // The defended "friendly" NPC/reactor -- absent on maps that don't use
+    // that half of the pattern, so the whole bar hides rather than showing
+    // an empty one.
+    const hasFriendly = mission.friendly_health_max > 0;
+    missionFriendlyBar.style.display = hasFriendly ? "block" : "none";
+    if (hasFriendly) {
+      const friendlyPct = Math.max(0, Math.min(1, mission.friendly_health / mission.friendly_health_max));
+      missionFriendlyFill.style.width = (friendlyPct * 100) + "%";
+      missionFriendlyLabel.textContent =
+        bossLabelText(mission.friendly_name, mission.friendly_health, mission.friendly_health_max);
+    }
+  } else if (mission.mode === "pve") {
+    missionPve.style.display = "flex";
+    const bossPct = mission.boss_health_max > 0
+      ? Math.max(0, Math.min(1, mission.boss_health / mission.boss_health_max)) : 0;
+    missionPveBossFill.style.width = (bossPct * 100) + "%";
+    missionPveBossLabel.textContent = bossLabelText(mission.boss_name, mission.boss_health, mission.boss_health_max);
+  } else if (mission.mode === "superagent") {
+    missionSuperagent.style.display = "flex";
+    const bossAlive = mission.boss_health_max > 0 && mission.boss_health > 0;
+    const bossPct = mission.boss_health_max > 0
+      ? Math.max(0, Math.min(1, mission.boss_health / mission.boss_health_max)) : 0;
+    missionSuperagentBossFill.style.width = (bossPct * 100) + "%";
+    missionSuperagentBossLabel.textContent = mission.boss_health_max > 0
+      ? bossLabelText(mission.boss_name, mission.boss_health, mission.boss_health_max)
+      : "Boss defeated";
+
+    // Boss first, then the two sequential captures (the 5-min hold, then
+    // the final dropship point) once it's dead -- matches the mission's
+    // real flow (kill boss -> only the captures matter after that).
+    if (bossAlive) {
+      missionSuperagentPoints.style.display = "none";
+    } else {
+      missionSuperagentPoints.style.display = "flex";
+      const points = (mission.objectives || []).slice().sort((a, b) => a.priority - b.priority);
+      renderTugBarStack(missionSuperagentPoints, missionSuperagentTugBars, points);
+    }
+  } else if (mission.mode === "koth") {
+    missionKoth.style.display = "flex";
+    const points = (mission.objectives || []).slice().sort((a, b) => a.priority - b.priority);
+    // active-and-unlocked is the one point currently eligible to be
+    // contested; everything else is locked/pending during a rotation swap.
+    const activeIdx = points.findIndex(o => o.active && !o.locked);
+    if (activeIdx >= 0) {
+      const frac = tugFractions(points[activeIdx].capture_pct != null ? points[activeIdx].capture_pct : 0.5);
+      missionKothFillAtk.style.width = (frac.atk * 100) + "%";
+      missionKothFillDef.style.width = (frac.def * 100) + "%";
+      missionKothLabel.textContent = pointLabels(points)[activeIdx];
+    } else {
+      missionKothFillAtk.style.width = "50%";
+      missionKothFillDef.style.width = "50%";
+      missionKothLabel.textContent = "Point being selected";
+    }
+
+    const toWin = mission.points_to_win > 0 ? mission.points_to_win : 3;
+    renderPointsPips(missionKothPipsAtk, mission.attacker_points || 0, toWin, "attackers");
+    renderPointsPips(missionKothPipsDef, mission.defender_points || 0, toWin, "defenders");
+  } else if (mission.mode === "breach") {
+    missionBreach.style.display = "flex";
+    // Sequential, not simultaneous -- only the currently active/unlocked
+    // point gets a live tug fill; later points render "locked" until the
+    // earlier one is captured (see renderTugBarStack).
+    const points = (mission.objectives || []).slice().sort((a, b) => a.priority - b.priority);
+    renderTugBarStack(missionBreach, missionBreachTugBars, points);
+  } else if (mission.mode === "payload") {
+    missionPayload.style.display = "flex";
+    // One connected pill, N equal segments -- see renderPayloadBar.
+    const points = (mission.objectives || []).slice().sort((a, b) => a.priority - b.priority);
+    renderPayloadBar(points);
+  }
+}
+
+function renderTeam(containerId, players) {
+  const container = document.getElementById(containerId);
+  const stateMap = teamCardState[containerId];
+  const seen = new Set();
+
+  players.forEach(p => {
+    seen.add(p.player_key);
+    let state = stateMap.get(p.player_key);
+    if (!state) {
+      state = buildCard(p);
+      stateMap.set(p.player_key, state);
+    }
+    updateCard(state, p);
+    // appendChild on a node already in the document just MOVES it -- no
+    // destroy/recreate -- so reordering to match sortByClassOrder never
+    // touches an <img> and can't reintroduce the flicker.
+    container.appendChild(state.card);
+  });
+
+  // Drop cards for players no longer present (left the team/instance).
+  for (const [key, state] of stateMap) {
+    if (!seen.has(key)) {
+      state.card.remove();
+      stateMap.delete(key);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Demo mode — 3v3 sample match, not real game data. Exists to rehearse
+// layout, the icon-overflow/wrapping behavior (deliberately generous
+// per-player effect count), and class icons, all without needing a live
+// match. profile_id below is a plain 1..6 placeholder, not a real class
+// enum -- point the class-icon-path input at a local folder containing
+// "1.png".."6.png" to see class icons render.
+// ---------------------------------------------------------------------------
+// profile_id values are the real GameTypes.h GA_G::PROFILE_ID_* constants
+// (567=Medic, 680=Assault, 681=Recon, 679=Robotic) -- matches
+// PROFILE_ID_TO_CLASS_ICON so demo mode exercises the real class-icon
+// lookup, not a placeholder id space.
+const DEMO_ROSTER = [
+  { name: "Zipe",            task_force: 1, profile_id: 681, build: {balanced:6, tree1:0, tree2:7} },
+  { name: "Kelrior",         task_force: 1, profile_id: 567, build: {balanced:3, tree1:10, tree2:0} },
+  { name: "Neophyte",        task_force: 1, profile_id: 680, build: {balanced:4, tree1:5, tree2:4} },
+  { name: "Jeronyx",         task_force: 2, profile_id: 680, build: {balanced:6, tree1:7, tree2:0} },
+  { name: "AngelDelaGuarda", task_force: 2, profile_id: 567, build: {balanced:0, tree1:13, tree2:0} },
+  { name: "Zaxik",           task_force: 2, profile_id: 681, build: {balanced:3, tree1:3, tree2:7} },
+];
+
+// The actual whitelisted effect ids (OverlayIdCatalog::kEffectIds on the
+// control server, from FOR_CLAUDE_EFFECT_IDS.txt) -- NOT arbitrary
+// placeholders. Name a local test file "<id>.png" for any id below (e.g.
+// "7777.png") and point the icon-path input at that folder to see it render
+// for real, exactly as it would in production.
+const DEMO_EFFECT_ID_POOL = [
+  2654, 5810, 5818, 5835, 5848, 5861, 5873, 5969, 6014, 6020, 6821, 6951,
+  6980, 7026, 7312, 7342, 7351, 7380, 7777, 8690, 8964, 8976, 9074, 9076,
+  9129, 9133, 9185, 9260, 9315, 9579, 9603, 10277, 10538, 10740, 10746, 10758,
+  10817, 10818, 10832, 10847, 10858, 12655, 12658, 12659, 12884, 13000, 13024, 13026,
+  13029, 13050, 13086, 13087, 13091, 13092, 13108, 16631, 16647, 16668, 16908, 16909,
+  16921, 18771, 18773, 18777, 18947, 18951, 18971, 18975, 21289, 21290, 21291, 21292,
+  22271, 22272, 22273, 22316, 22335, 22341, 22344, 22348, 22351, 22357, 22358, 22368,
+  22379, 22381, 22384, 22387, 22394, 22408, 22409, 22411, 23966, 23967, 23970, 23971,
+  23983, 24240, 24371, 24380, 24383, 24408, 25346, 25348, 25372, 25373, 25397, 25398,
+  25721, 25724, 25735, 25740, 25803, 25809, 25811, 25817, 25861, 25862, 25865, 25869,
+  25876, 25877, 25878, 25880, 25882, 25883, 25884, 25886, 25888, 25889, 25890, 25892,
+  25893, 25896, 25902, 25904, 25987, 25988, 25990, 25993, 25995, 25997, 26009, 26011,
+  26012, 26056, 26095, 26098, 26181, 26182, 26183, 26185, 26193, 26254, 26256, 26269,
+  26271, 26272, 26513, 26514, 26520, 26521, 26523, 26525, 26617, 26638, 26640, 26641,
+  26646, 26651, 26668, 26702, 27432, 27434, 27435, 27437, 27438, 27477, 27479, 27480,
+  27498, 27499, 27501, 27504, 27505, 27507, 27525, 27526, 27528, 27529, 27532, 27534,
+  27536, 27537, 27538, 27540, 27542, 27543, 27544, 27546, 27548, 27549, 27550, 27552,
+  27582, 27584, 27585, 27587, 27588, 27593, 27617, 27646, 27710, 27731, 27732, 27761,
+];
+// Deliberately generous -- exceeds MAX_VISIBLE_EFFECTS so the overflow badge
+// and multi-row wrapping both get exercised on nearly every tick.
+const DEMO_MIN_EFFECTS = 8;
+const DEMO_MAX_EFFECTS = 14;
+
+// Per-player running state so demo health/buffs drift instead of jumping
+// around every poll.
+const demoState = new Map();
+
+// Mission-progress demo -- cycles through ticket, raid, pve, superagent,
+// koth, breach, payload every 6s so layout/positioning for all of them can
+// be rehearsed without needing seven different live matches. Running
+// counters persist across polls the same way demoState does above, so
+// values drift smoothly instead of jumping.
+const demoMissionState = {
+  // Shared match timer -- cycles setup(1) -> running(2) -> overtime(3) ->
+  // back to a fresh setup, independent of which mode is currently showing,
+  // to rehearse #mission-timer's states/colors without a live match.
+  timerRemaining: 20, timerState: 1,
+
+  // ticket -- overall score (unrelated to the per-point tug bars below) plus
+  // 3 simultaneously-active capture points that drift around the neutral
+  // midpoint (0.5), same as a real contested Control map. Distinct real-
+  // looking names (map-authored points genuinely have distinct
+  // nObjectiveIds/names, unlike koth's shared-pool ids below) to exercise
+  // the friendly-name label path.
+  ticketAttackerPoints: 0, ticketDefenderPoints: 0,
+  ticketPoints: [
+    { id: 272, name: "Security Gate 1", priority: 1, locked: false, active: true, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 273, name: "Tower Gates",      priority: 2, locked: false, active: true, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 274, name: "Tower Controls",   priority: 3, locked: false, active: true, owner_taskforce: 0, capture_pct: 0.5 },
+  ],
+
+  round: 1, bossHealth: 100000, bossHealthMax: 100000,
+  friendlyHealth: 30000, friendlyHealthMax: 30000,
+
+  // pve -- a single boss bar, no capture points.
+  pveBossHealth: 60000, pveBossHealthMax: 60000,
+
+  // superagent -- boss bar first; once it's dead, the two sequential
+  // captures (the 5-min hold, then the final dropship point) cycle forever
+  // via advanceSequentialCapture's own wraparound (see below) -- fine for a
+  // rehearsal loop even though the real mission only plays that once.
+  superagentBossHealth: 50000, superagentBossHealthMax: 50000,
+  superagentPoints: [
+    { id: 194, name: "", priority: 2, locked: true, active: false, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 287, name: "", priority: 3, locked: true, active: false, owner_taskforce: 0, capture_pct: 0.5 },
+  ],
+
+  // koth -- a small rotation pool sharing the same id/priority/name
+  // (exactly like CtrPointRotation.cpp's real pool) with one point active
+  // at a time. capture_pct tugs toward 0 (attacker) or 1 (defender);
+  // reaching an extreme awards that team a point and starts a brief
+  // "being selected" gap. name left "" to exercise the numbered fallback --
+  // real koth points don't resolve a usable distinct name either.
+  kothAttackerPoints: 0, kothDefenderPoints: 0,
+  kothPoints: [
+    { id: 345, name: "", priority: 1, locked: true, active: false, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 345, name: "", priority: 1, locked: true, active: false, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 345, name: "", priority: 1, locked: true, active: false, owner_taskforce: 0, capture_pct: 0.5 },
+  ],
+  kothRotatingUntil: 0,
+
+  // breach -- sequential 3-point unlock chain, rendered as stacked tug bars.
+  breachObjectives: [
+    { id: 272, name: "Security Gate 1", priority: 1, locked: false, active: true,  owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 273, name: "Tower Gates",     priority: 2, locked: true,  active: false, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 274, name: "Tower Controls",  priority: 3, locked: true,  active: false, owner_taskforce: 0, capture_pct: 0.5 },
+  ],
+
+  // payload -- same sequential-unlock mechanic as breach, but rendered as
+  // one connected segmented pill (see renderPayloadBar) instead of stacked
+  // separate bars. No name display on this widget, so names are irrelevant
+  // here -- left blank like the real objId=60-shared-across-checkpoints
+  // payload map observed in testing.
+  payloadObjectives: [
+    { id: 60, name: "", priority: 1, locked: false, active: true,  owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 60, name: "", priority: 2, locked: true,  active: false, owner_taskforce: 0, capture_pct: 0.5 },
+    { id: 60, name: "", priority: 3, locked: true,  active: false, owner_taskforce: 0, capture_pct: 0.5 },
+  ],
+};
+
+// Advances the shared demo timer by ~0.3s (one poll tick) and cycles
+// setup -> running -> overtime -> a fresh setup, independent of whichever
+// mode generateDemoMission() returns this tick.
+function advanceDemoTimer() {
+  demoMissionState.timerRemaining -= 0.3;
+  if (demoMissionState.timerRemaining <= 0) {
+    if (demoMissionState.timerState === 1) { demoMissionState.timerState = 2; demoMissionState.timerRemaining = 25; }
+    else if (demoMissionState.timerState === 2) { demoMissionState.timerState = 3; demoMissionState.timerRemaining = 10; }
+    else { demoMissionState.timerState = 1; demoMissionState.timerRemaining = 20; }
+  }
+  return {
+    mission_remaining_seconds: demoMissionState.timerRemaining,
+    mission_timer_state: demoMissionState.timerState,
+  };
+}
+
+function generateDemoMission() {
+  const mode = DEMO_MISSION_MODE !== "auto"
+    ? DEMO_MISSION_MODE
+    : ["ticket", "raid", "pve", "superagent", "koth", "breach", "payload"][Math.floor(Date.now() / 6000) % 7];
+
+  if (mode === "ticket") {
+    demoMissionState.ticketAttackerPoints = Math.min(800, demoMissionState.ticketAttackerPoints + Math.random() * 6);
+    demoMissionState.ticketDefenderPoints = Math.min(800, demoMissionState.ticketDefenderPoints + Math.random() * 4);
+    demoMissionState.ticketPoints.forEach(o => {
+      o.capture_pct = Math.max(0, Math.min(1, o.capture_pct + (Math.random() - 0.5) * 0.08));
+    });
+    return {
+      mode,
+      attacker_points: Math.round(demoMissionState.ticketAttackerPoints),
+      defender_points: Math.round(demoMissionState.ticketDefenderPoints),
+      points_to_win: 800,
+      objectives: demoMissionState.ticketPoints.map(o => ({ ...o })),
+    };
+  }
+
+  if (mode === "raid") {
+    demoMissionState.bossHealth -= Math.random() * 900;
+    if (demoMissionState.bossHealth <= 0) {
+      demoMissionState.bossHealth = demoMissionState.bossHealthMax;
+      demoMissionState.round = demoMissionState.round >= 4 ? 1 : demoMissionState.round + 1;
+    }
+    // The defended "friendly" NPC drains slowly and independently of the
+    // boss -- on a real map this only moves if the attackers reach it, but
+    // for layout rehearsal a steady trickle is enough to show the bar isn't
+    // static.
+    demoMissionState.friendlyHealth = Math.max(0, demoMissionState.friendlyHealth - Math.random() * 150);
+    if (demoMissionState.friendlyHealth <= 0) demoMissionState.friendlyHealth = demoMissionState.friendlyHealthMax;
+    return {
+      mode,
+      round_current: demoMissionState.round,
+      round_max: 4,
+      boss_health: Math.max(0, Math.round(demoMissionState.bossHealth)),
+      boss_health_max: demoMissionState.bossHealthMax,
+      boss_name: "Colony Dismantler",
+      friendly_health: Math.round(demoMissionState.friendlyHealth),
+      friendly_health_max: demoMissionState.friendlyHealthMax,
+      friendly_name: "Bancroft",
+    };
+  }
+
+  if (mode === "pve") {
+    demoMissionState.pveBossHealth -= Math.random() * 900;
+    if (demoMissionState.pveBossHealth <= 0) demoMissionState.pveBossHealth = demoMissionState.pveBossHealthMax;
+    return {
+      mode,
+      boss_health: Math.max(0, Math.round(demoMissionState.pveBossHealth)),
+      boss_health_max: demoMissionState.pveBossHealthMax,
+      boss_name: "Ancient Guardian",
+    };
+  }
+
+  if (mode === "koth") {
+    const points = demoMissionState.kothPoints;
+    let active = points.find(o => o.active && !o.locked);
+    if (!active && Date.now() > demoMissionState.kothRotatingUntil) {
+      const next = points[Math.floor(Math.random() * points.length)];
+      next.locked = false; next.active = true; next.capture_pct = 0.5;
+      active = next;
+    }
+    if (active) {
+      active.capture_pct = Math.max(0, Math.min(1, active.capture_pct + (Math.random() - 0.5) * 0.06));
+      if (active.capture_pct <= 0.02 || active.capture_pct >= 0.98) {
+        if (active.capture_pct <= 0.02) demoMissionState.kothAttackerPoints++;
+        else demoMissionState.kothDefenderPoints++;
+        active.locked = true;
+        active.active = false;
+        active.capture_pct = 0.5;
+        demoMissionState.kothRotatingUntil = Date.now() + 2000;
+      }
+    }
+    return {
+      mode,
+      attacker_points: demoMissionState.kothAttackerPoints,
+      defender_points: demoMissionState.kothDefenderPoints,
+      points_to_win: 3,
+      objectives: points.map(o => ({ ...o })),
+    };
+  }
+
+  // Shared by breach (stacked bars) and payload (one segmented pill) --
+  // sequential tug-of-war: the active point starts neutral (0.5) same as
+  // koth's, but only capturing it all the way to the ATTACKER'S end unlocks
+  // the next one -- defenders pushing it back near their own end just gets
+  // bounced short of completing, matching "defenders defend, attackers must
+  // break through" rather than koth's either-team-can-win-it.
+  function advanceSequentialCapture(objs) {
+    const active = objs.find(o => o.active && !o.locked);
+    if (!active) return;
+    active.capture_pct = Math.max(0, Math.min(1, active.capture_pct + (Math.random() - 0.42) * 0.05));
+    if (active.capture_pct <= 0.02) {
+      active.locked = true;
+      active.active = false;
+      const next = objs[objs.indexOf(active) + 1];
+      if (next) { next.locked = false; next.active = true; next.capture_pct = 0.5; }
+      else { objs.forEach((o, i) => { o.locked = i !== 0; o.active = i === 0; o.capture_pct = 0.5; }); }
+    } else if (active.capture_pct >= 0.9) {
+      active.capture_pct = 0.75;
+    }
+  }
+
+  if (mode === "superagent") {
+    if (demoMissionState.superagentBossHealth > 0) {
+      demoMissionState.superagentBossHealth = Math.max(0, demoMissionState.superagentBossHealth - Math.random() * 1500);
+      if (demoMissionState.superagentBossHealth <= 0) {
+        demoMissionState.superagentPoints[0].locked = false;
+        demoMissionState.superagentPoints[0].active = true;
+      }
+    } else {
+      advanceSequentialCapture(demoMissionState.superagentPoints);
+    }
+    return {
+      mode,
+      boss_health: Math.round(demoMissionState.superagentBossHealth),
+      boss_health_max: demoMissionState.superagentBossHealthMax,
+      boss_name: "Colony Dismantler",
+      objectives: demoMissionState.superagentPoints.map(o => ({ ...o })),
+    };
+  }
+
+  if (mode === "breach") {
+    advanceSequentialCapture(demoMissionState.breachObjectives);
+    return { mode, objectives: demoMissionState.breachObjectives.map(o => ({ ...o })) };
+  }
+
+  // payload
+  advanceSequentialCapture(demoMissionState.payloadObjectives);
+  return { mode, objectives: demoMissionState.payloadObjectives.map(o => ({ ...o })) };
+}
+
+function generateDemoSnapshot() {
+  const players = DEMO_ROSTER.map((p, idx) => {
+    let st = demoState.get(p.name);
+    if (!st) {
+      st = { health: 1300, health_max: 1300, power: 100, power_max: 100, effect_ids: [] };
+      demoState.set(p.name, st);
+    }
+    st.health += (Math.random() - 0.55) * 45;
+    st.health = Math.max(0, Math.min(st.health_max, Math.round(st.health)));
+    st.power += (Math.random() - 0.45) * 12;
+    st.power = Math.max(0, Math.min(st.power_max, Math.round(st.power)));
+    if (Math.random() < 0.08) {
+      const count = DEMO_MIN_EFFECTS +
+        Math.floor(Math.random() * (DEMO_MAX_EFFECTS - DEMO_MIN_EFFECTS + 1));
+      const pool = DEMO_EFFECT_ID_POOL.slice();
+      const chosen = [];
+      while (chosen.length < count && pool.length) {
+        chosen.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+      }
+      st.effect_ids = chosen;
+    }
+    return {
+      player_key: "demo-" + idx,
+      player_name: p.name,
+      task_force: p.task_force,
+      profile_id: p.profile_id,
+      health: st.health,
+      health_max: st.health_max,
+      power: st.power,
+      power_max: st.power_max,
+      effect_ids: st.effect_ids,
+      build: p.build,
+    };
+  });
+  return { instance_id: "DEMO", players };
+}
+
+async function poll() {
+  const status = document.getElementById("status");
+
+  if (DEMO_MODE) {
+    const data = generateDemoSnapshot();
+    renderTeam("cards-attackers", sortByClassOrder(data.players.filter(p => p.task_force === 1)));
+    renderTeam("cards-defenders", sortByClassOrder(data.players.filter(p => p.task_force === 2)));
+    updateMissionPanel({ ...generateDemoMission(), ...advanceDemoTimer() });
+    status.textContent = "DEMO MODE — " + data.players.length + " sample players";
+    return;
+  }
+
+  if (!INSTANCE_ID) {
+    status.textContent = "select an instance above to begin";
+    renderTeam("cards-attackers", []);
+    renderTeam("cards-defenders", []);
+    updateMissionPanel(null);
+    return;
+  }
+
+  try {
+    let url = OVERLAY_BASE_URL + "?instance_id=" + encodeURIComponent(INSTANCE_ID);
+    if (OVERLAY_TOKEN) url += "&token=" + encodeURIComponent(OVERLAY_TOKEN);
+    const resp = await fetch(url, { cache: "no-store" });
+    if (!resp.ok) {
+      status.textContent = "overlay: HTTP " + resp.status;
+      return;
+    }
+    const data = await resp.json();
+    const players = data.players || [];
+
+    renderTeam("cards-attackers", sortByClassOrder(players.filter(p => p.task_force === 1)));
+    renderTeam("cards-defenders", sortByClassOrder(players.filter(p => p.task_force === 2)));
+    updateMissionPanel(data.mission || null);
+
+    status.textContent = "instance " + data.instance_id + " — " + players.length + " tracked";
+  } catch (e) {
+    status.textContent = "overlay: " + e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Build notation ("P/T1/T2") -- polled on its own slower cadence
+// (BUILDS_POLL_MS) rather than piggybacked on the 300ms health/effects
+// poll. Populates buildCache by player_key; renderTeam() reads from it
+// directly rather than fetching per render. See OverlayHttpServer's
+// GET /overlay/builds and SkillTreeCatalog.hpp for why the split exists.
+// ---------------------------------------------------------------------------
+async function pollBuilds() {
+  if (!INSTANCE_ID) return;
+  try {
+    let url = OVERLAY_BUILDS_URL + "?instance_id=" + encodeURIComponent(INSTANCE_ID);
+    if (OVERLAY_TOKEN) url += "&token=" + encodeURIComponent(OVERLAY_TOKEN);
+    const resp = await fetch(url, { cache: "no-store" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const next = {};
+    (data.players || []).forEach(p => { next[p.player_key] = p; });
+    buildCache = next;
+  } catch (e) { /* transient network hiccup -- next poll retries */ }
+}
+
+// ---------------------------------------------------------------------------
+// Settings bar — instance picker + icon-folder path. Both persist to
+// localStorage so a hosted page (which the broadcast operator can't edit
+// directly) stays configured across reloads without touching this file.
+// ---------------------------------------------------------------------------
+async function refreshInstanceList() {
+  const select = document.getElementById("instance-select");
+  try {
+    let url = OVERLAY_INSTANCES_URL;
+    if (OVERLAY_TOKEN) url += "?token=" + encodeURIComponent(OVERLAY_TOKEN);
+    const resp = await fetch(url, { cache: "no-store" });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const instances = data.instances || [];
+
+    const currentValue = select.value;
+    select.innerHTML = "";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = instances.length
+      ? "Instance…"
+      : "No active broadcasts";
+    select.appendChild(placeholder);
+
+    instances.forEach(inst => {
+      const opt = document.createElement("option");
+      opt.value = String(inst.instance_id);
+      opt.textContent = "[" + inst.instance_id + "] " + (inst.map_name || "?")
+        + " (" + inst.player_count + " tracked)";
+      select.appendChild(opt);
+    });
+
+    // Preserve the current selection if it's still in the list; otherwise
+    // fall back to whatever INSTANCE_ID was loaded from localStorage on
+    // first refresh, so a page reload doesn't silently drop the operator's
+    // choice just because this poll landed before the instance came up.
+    const wanted = currentValue || (INSTANCE_ID ? String(INSTANCE_ID) : "");
+    if (wanted && [...select.options].some(o => o.value === wanted)) {
+      select.value = wanted;
+    } else if (instances.length) {
+      // No valid current selection (first load, or the previously selected
+      // instance ended) -- auto-pick the first active one. The dropdown
+      // itself isn't interactable inside an OBS browser source (no mouse/
+      // keyboard reaches it there), and in practice there's only ever one
+      // instance worth spectating at a time, so this is the only realistic
+      // way the page ever gets off "select an instance above" on its own.
+      const first = instances[0];
+      INSTANCE_ID = first.instance_id;
+      localStorage.setItem(INSTANCE_KEY, String(INSTANCE_ID));
+      select.value = String(INSTANCE_ID);
+    }
+  } catch (e) { /* transient network hiccup -- next poll retries */ }
+}
+
+document.getElementById("instance-select").addEventListener("change", (e) => {
+  INSTANCE_ID = Number(e.target.value) || 0;
+  localStorage.setItem(INSTANCE_KEY, String(INSTANCE_ID));
+});
+
+const iconsPathInput = document.getElementById("icons-path-input");
+iconsPathInput.value = ICONS_ROOT_PATH;
+function commitIconsPath() {
+  const val = iconsPathInput.value.trim();
+  if (!val) return;
+  ICONS_ROOT_PATH = val.endsWith("/") ? val : val + "/";
+  localStorage.setItem(ICONS_PATH_KEY, ICONS_ROOT_PATH);
+}
+iconsPathInput.addEventListener("change", commitIconsPath);
+iconsPathInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { commitIconsPath(); iconsPathInput.blur(); }
+});
+
+// ---------------------------------------------------------------------------
+// Layout editor — drag panels around, resize via the corner handle, and
+// persist the arrangement in localStorage so it survives a page reload
+// (OBS re-navigating the browser source, etc). Only active while
+// "Edit Layout" is toggled on; harmless/inert otherwise.
+// ---------------------------------------------------------------------------
+const LAYOUT_KEY = "spectatorOverlayLayout_v1";
+
+const LAYOUT_PANEL_IDS = ["panel-attackers", "panel-defenders", "mission-panel"];
+
+function saveLayout() {
+  const data = {};
+  LAYOUT_PANEL_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    data[id] = {
+      position: el.style.position || "",
+      left: el.style.left || "",
+      top: el.style.top || "",
+      scale: el.style.getPropertyValue("--scale") || "1",
+      // Only #mission-panel ever sets this (see freezePanelPosition) --
+      // dropping its translateX(-50%) centering term once it has an
+      // absolute left/top of its own. "" for the team panels, which never
+      // set an inline transform at all.
+      transform: el.style.transform || "",
+    };
+  });
+  localStorage.setItem(LAYOUT_KEY, JSON.stringify(data));
+}
+
+function loadLayout() {
+  const raw = localStorage.getItem(LAYOUT_KEY);
+  if (!raw) return;
+  try {
+    const data = JSON.parse(raw);
+    Object.keys(data).forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const d = data[id];
+      if (d.position) el.style.position = d.position;
+      if (d.left) el.style.left = d.left;
+      if (d.top) el.style.top = d.top;
+      if (d.scale) el.style.setProperty("--scale", d.scale);
+      if (d.transform) el.style.transform = d.transform;
+    });
+  } catch (e) { /* ignore corrupt/old data */ }
+}
+
+function resetLayout() {
+  localStorage.removeItem(LAYOUT_KEY);
+  LAYOUT_PANEL_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    el.style.position = "";
+    el.style.left = "";
+    el.style.top = "";
+    el.style.right = "";
+    el.style.margin = "";
+    el.style.transform = "";
+    el.style.setProperty("--scale", "1");
+  });
+}
+
+// Converts a panel from normal flex-flow into position:fixed at its CURRENT
+// on-screen spot, with no visual jump. Three bugs this fixes at once:
+//
+// 1. getBoundingClientRect() returns the POST-transform (post --scale)
+//    visual box, but CSS `left`/`top` position the PRE-transform box, which
+//    the scale transform is then applied to on top of that. For a panel
+//    whose transform-origin ISN'T "top left" (defenders is "top right"),
+//    those two boxes don't coincide once scale != 1, so naively feeding
+//    getBoundingClientRect() straight into left/top lands it somewhere
+//    else entirely — worse the more it's been resized. Fixed by inverting
+//    the origin math below instead of assuming visual == unscaled position.
+// 2. Converting ONLY the panel being dragged to position:fixed pulls it out
+//    of the #root flex layout — and since the OTHER panel is still a flex
+//    child, removing its sibling reflows IT to a new spot too (this is the
+//    "moving one snaps the other" bug, and the exact cause of "defenders
+//    snaps to the left the first time Edit Layout is clicked": #root is
+//    `justify-content: space-between`, and a SINGLE remaining flex child in
+//    a space-between container sits at the start/left edge). Fixed by
+//    measuring EVERY panel's rect up front (see the `rect` param + the
+//    edit-toggle handler below) before mutating ANY of their styles, so a
+//    still-in-flow panel is never measured after an earlier one already
+//    left the flow.
+// 3. #mission-panel isn't a flex child at all -- it's centered via
+//    `left: 50%; transform: translateX(-50%) scale(...)`. Passing
+//    anchorSide "left" treats its rect like a left-anchored box (correct,
+//    since translateX(-50%) is a pure horizontal shift with no scale-
+//    dependent origin math of its own); the caller additionally clears the
+//    translateX term from its inline transform afterward, since an
+//    absolute pixel `left` shouldn't also get a further -50%-of-width shift.
+function freezePanelPosition(panel, anchorSide, rect) {
+  if (panel.style.position === "fixed" && panel.style.left && panel.style.top) return;
+
+  rect = rect || panel.getBoundingClientRect(); // visual, post-transform
+  const scale = parseFloat(getComputedStyle(panel).getPropertyValue("--scale")) || 1;
+  const unscaledWidth = rect.width / scale;
+
+  // Vertical transform-origin is always "top", so visual top == unscaled
+  // top regardless of scale — no correction needed there.
+  let unscaledLeft = rect.left;
+  if (anchorSide === "right") {
+    // origin = unscaled_left + width (the right edge); visual_left is that
+    // origin minus the SCALED width. Solve back for unscaled_left.
+    unscaledLeft = rect.left + unscaledWidth * (scale - 1);
+  }
+
+  panel.style.position = "fixed";
+  panel.style.left = unscaledLeft + "px";
+  panel.style.top = rect.top + "px";
+  panel.style.right = "auto";
+  panel.style.margin = "0";
+}
+
+function makeDraggable(panel, handle) {
+  handle.addEventListener("mousedown", (e) => {
+    if (!document.body.classList.contains("edit-mode")) return;
+    e.preventDefault();
+
+    // By the time a drag can start, entering edit mode has already frozen
+    // both panels into position:fixed (see edit-toggle handler) — just read
+    // the already-correct style values rather than re-deriving from
+    // getBoundingClientRect(), which sidesteps the transform-math entirely.
+    const startX = e.clientX, startY = e.clientY;
+    const origLeft = parseFloat(panel.style.left) || 0;
+    const origTop = parseFloat(panel.style.top) || 0;
+
+    function onMove(ev) {
+      panel.style.left = (origLeft + ev.clientX - startX) + "px";
+      panel.style.top  = (origTop + ev.clientY - startY) + "px";
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      saveLayout();
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+function makeResizable(panel, handle) {
+  handle.addEventListener("mousedown", (e) => {
+    if (!document.body.classList.contains("edit-mode")) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const startX = e.clientX;
+    const startScale = parseFloat(getComputedStyle(panel).getPropertyValue("--scale")) || 1;
+    const dir = handle.dataset.side === "left" ? 1 : -1; // drag right grows a left-anchored panel; mirror for right-anchored
+
+    function onMove(ev) {
+      const delta = (ev.clientX - startX) * dir;
+      let scale = startScale + delta / 220;
+      scale = Math.max(0.5, Math.min(2.5, scale));
+      panel.style.setProperty("--scale", scale.toFixed(3));
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      saveLayout();
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+// Drag left/right on the "Resize Both" button to scale both panels together
+// in one motion. Applies the same delta to each panel's OWN current scale
+// (rather than forcing them to a shared value first), so if they're already
+// different sizes that difference is preserved while both grow/shrink.
+function makeGlobalResizer(handle) {
+  handle.addEventListener("mousedown", (e) => {
+    if (!document.body.classList.contains("edit-mode")) return;
+    e.preventDefault();
+
+    const atk = document.getElementById("panel-attackers");
+    const def = document.getElementById("panel-defenders");
+    const startX = e.clientX;
+    const startScaleAtk = parseFloat(getComputedStyle(atk).getPropertyValue("--scale")) || 1;
+    const startScaleDef = parseFloat(getComputedStyle(def).getPropertyValue("--scale")) || 1;
+
+    function onMove(ev) {
+      const delta = (ev.clientX - startX) / 220;
+      const sAtk = Math.max(0.5, Math.min(2.5, startScaleAtk + delta));
+      const sDef = Math.max(0.5, Math.min(2.5, startScaleDef + delta));
+      atk.style.setProperty("--scale", sAtk.toFixed(3));
+      def.style.setProperty("--scale", sDef.toFixed(3));
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      saveLayout();
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+makeGlobalResizer(document.getElementById("resize-both"));
+
+document.getElementById("edit-toggle").addEventListener("click", (e) => {
+  const enteringEditMode = !document.body.classList.contains("edit-mode");
+  document.body.classList.toggle("edit-mode");
+  e.target.classList.toggle("active");
+
+  if (enteringEditMode) {
+    // Measure every panel's rect BEFORE freezing any of them — freezing
+    // attackers first would pull it out of #root's flex flow, and #root is
+    // `justify-content: space-between`, so a still-in-flow defenders panel
+    // measured AFTER that already reflowed to the left edge (a single
+    // remaining flex child in a space-between container sits at the
+    // start). That reflowed (wrong) position then got baked in as
+    // defenders' "current" spot -- the exact "defenders snaps left on the
+    // first Edit Layout click" bug. Measuring all three up front, then
+    // freezing all three against those pre-measured rects, means none of
+    // them is ever read after an earlier one already left the flow.
+    const atkPanel = document.getElementById("panel-attackers");
+    const defPanel = document.getElementById("panel-defenders");
+    // #mission-panel is forced visible in edit mode (see its CSS) regardless
+    // of live/demo data, specifically so it's always measurable/draggable
+    // here -- the "edit-mode" class was just added above, synchronously, so
+    // this rect already reflects that.
+    const atkRect = atkPanel.getBoundingClientRect();
+    const defRect = defPanel.getBoundingClientRect();
+    const missionRect = missionPanel.getBoundingClientRect();
+
+    freezePanelPosition(atkPanel, "left", atkRect);
+    freezePanelPosition(defPanel, "right", defRect);
+    freezePanelPosition(missionPanel, "left", missionRect);
+    // Drop the centering translateX(-50%) now that left/top are absolute
+    // pixels of their own -- keeping it would double-offset the panel.
+    missionPanel.style.transform = "scale(var(--scale))";
+    saveLayout();
+  }
+});
+document.getElementById("reset-layout").addEventListener("click", resetLayout);
+
+const demoBtn = document.getElementById("demo-toggle");
+function refreshDemoButton() {
+  demoBtn.textContent = DEMO_MODE ? "Demo Mode: ON" : "Demo Mode: OFF";
+  demoBtn.classList.toggle("active", DEMO_MODE);
+}
+demoBtn.addEventListener("click", () => {
+  DEMO_MODE = !DEMO_MODE;
+  refreshDemoButton();
+});
+refreshDemoButton();
+
+const demoMissionSelect = document.getElementById("demo-mission-select");
+demoMissionSelect.addEventListener("change", (e) => {
+  DEMO_MISSION_MODE = e.target.value;
+});
+
+const hpBtn = document.getElementById("hp-toggle");
+function refreshHpButton() {
+  hpBtn.textContent = showHpNumber ? "HP Number: ON" : "HP Number: OFF";
+  hpBtn.classList.toggle("active", showHpNumber);
+}
+hpBtn.addEventListener("click", () => {
+  showHpNumber = !showHpNumber;
+  localStorage.setItem(SHOW_HP_KEY, showHpNumber ? "1" : "0");
+  refreshHpButton();
+});
+refreshHpButton();
+
+const powerBtn = document.getElementById("power-toggle");
+function refreshPowerButton() {
+  powerBtn.textContent = showPowerNumber ? "Power Number: ON" : "Power Number: OFF";
+  powerBtn.classList.toggle("active", showPowerNumber);
+}
+powerBtn.addEventListener("click", () => {
+  showPowerNumber = !showPowerNumber;
+  localStorage.setItem(SHOW_POWER_KEY, showPowerNumber ? "1" : "0");
+  refreshPowerButton();
+});
+refreshPowerButton();
+
+// ---------------------------------------------------------------------------
+// Hide-section toggles + Swap Colours -- all four are plain body-class
+// switches persisted in localStorage, same mechanism as admin-hidden below.
+// Applied on load (see the body.classList.add calls) before the first
+// render, so there's no flash of the default state on a reload.
+// ---------------------------------------------------------------------------
+function makeBodyClassToggle(buttonId, className, storageKey, onLabel, offLabel) {
+  const btn = document.getElementById(buttonId);
+  if (localStorage.getItem(storageKey) === "1") document.body.classList.add(className);
+  function refresh() {
+    const on = document.body.classList.contains(className);
+    btn.textContent = on ? onLabel : offLabel;
+    btn.classList.toggle("active", on);
+  }
+  btn.addEventListener("click", () => {
+    const on = document.body.classList.toggle(className);
+    localStorage.setItem(storageKey, on ? "1" : "0");
+    refresh();
+  });
+  refresh();
+}
+makeBodyClassToggle("hide-attackers-toggle", "hide-attackers", "spectatorOverlayHideAttackers_v1",
+  "Attackers: HIDDEN", "Hide Attackers");
+makeBodyClassToggle("hide-defenders-toggle", "hide-defenders", "spectatorOverlayHideDefenders_v1",
+  "Defenders: HIDDEN", "Hide Defenders");
+makeBodyClassToggle("hide-mission-toggle", "hide-mission", "spectatorOverlayHideMission_v1",
+  "Mission Info: HIDDEN", "Hide Mission Info");
+makeBodyClassToggle("swap-colors-toggle", "colors-swapped", "spectatorOverlayColorsSwapped_v1",
+  "Colours: SWAPPED", "Swap Colours");
+
+["panel-attackers", "panel-defenders"].forEach(id => {
+  const panel = document.getElementById(id);
+  makeDraggable(panel, panel.querySelector(".team-label"));
+  makeResizable(panel, panel.querySelector(".resize-handle"));
+});
+makeDraggable(missionPanel, missionPanel.querySelector(".mission-panel-handle"));
+makeResizable(missionPanel, missionPanel.querySelector(".resize-handle"));
+
+loadLayout();
+poll();
+setInterval(poll, POLL_MS);
+refreshInstanceList();
+setInterval(refreshInstanceList, INSTANCE_LIST_POLL_MS);
+pollBuilds();
+setInterval(pollBuilds, BUILDS_POLL_MS);
+
+// ---------------------------------------------------------------------------
+// Admin bar hide toggle -- press H to hide/show the instance/icon-path
+// settings bar and the edit-layout controls. Meant for putting this page
+// directly into an OBS Browser Source: hide the admin strip once configured
+// so the stream never shows it, without relying on cropping (which breaks
+// if the page's layout ever shifts). Persists across reloads.
+// ---------------------------------------------------------------------------
+const ADMIN_HIDDEN_KEY = "spectatorOverlayAdminHidden_v1";
+if (localStorage.getItem(ADMIN_HIDDEN_KEY) === "1") {
+  document.body.classList.add("admin-hidden");
+}
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "h" && e.key !== "H") return;
+  // Don't hijack the H key while the operator is typing into a text input.
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+  const hidden = document.body.classList.toggle("admin-hidden");
+  localStorage.setItem(ADMIN_HIDDEN_KEY, hidden ? "1" : "0");
+});
+</script>
+
+</body>
+</html>

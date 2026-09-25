@@ -1,0 +1,123 @@
+#include "check.hpp"
+#include "src/ControlServer/MatchmakingService/MmrSwap.hpp"
+
+#include <cmath>
+#include <unordered_map>
+#include <vector>
+
+using MmrSwap::Player;
+
+namespace {
+
+double Diff(const std::vector<Player>& ps,
+            const std::unordered_map<std::string, int>& asn) {
+    double d = 0.0;
+    for (const auto& p : ps) d += (asn.at(p.guid) == 1) ? p.mmr : -p.mmr;
+    return d;
+}
+
+TEST(mmr_swap_converges_same_class) {
+    std::vector<Player> ps = {
+        {"a", 680, 1200.0, true}, {"b", 680, 1100.0, true},
+        {"c", 680, 1000.0, true}, {"d", 680,  900.0, true},
+    };
+    std::unordered_map<std::string, int> asn =
+        {{"a", 1}, {"b", 1}, {"c", 2}, {"d", 2}};   // 2300 vs 1900
+    const int swaps = MmrSwap::BalanceByMmr(ps, asn);
+    CHECK(swaps >= 1);
+    CHECK(std::fabs(Diff(ps, asn)) < 1e-6);          // 2100 vs 2100 reachable
+    int on1 = 0;
+    for (const auto& kv : asn) if (kv.second == 1) on1++;
+    CHECK(on1 == 2);                                  // counts invariant
+}
+
+TEST(mmr_swap_never_crosses_classes) {
+    std::vector<Player> ps = {
+        {"m1", 567, 1400.0, true}, {"a1", 680, 1000.0, true},
+        {"m2", 567,  800.0, true}, {"a2", 680, 1000.0, true},
+    };
+    std::unordered_map<std::string, int> asn =
+        {{"m1", 1}, {"a1", 1}, {"m2", 2}, {"a2", 2}};
+    MmrSwap::BalanceByMmr(ps, asn);
+    // Only the medic pair can swap; every team keeps 1 medic + 1 assault.
+    CHECK(asn.at("m1") != asn.at("m2"));
+    CHECK(asn.at("a1") != asn.at("a2"));
+}
+
+TEST(mmr_swap_respects_unswappable) {
+    std::vector<Player> ps = {
+        {"p1", 680, 1500.0, false},   // party member, locked
+        {"p2", 680,  500.0, false},
+        {"s1", 680, 1400.0, true},
+        {"s2", 680,  600.0, true},
+    };
+    std::unordered_map<std::string, int> asn =
+        {{"p1", 1}, {"s1", 1}, {"p2", 2}, {"s2", 2}};   // 2900 vs 1100
+    MmrSwap::BalanceByMmr(ps, asn);
+    CHECK(asn.at("p1") == 1);                            // locked stayed
+    CHECK(asn.at("p2") == 2);
+    CHECK(asn.at("s1") == 2);                            // solos swapped
+    CHECK(asn.at("s2") == 1);
+}
+
+TEST(mmr_swap_noop_on_equal_ratings) {
+    std::vector<Player> ps = {
+        {"a", 680, 1000.0, true}, {"b", 680, 1000.0, true},
+    };
+    std::unordered_map<std::string, int> asn = {{"a", 1}, {"b", 2}};
+    CHECK(MmrSwap::BalanceByMmr(ps, asn) == 0);
+    CHECK(asn.at("a") == 1);
+}
+
+TEST(mmr_swap_seed_diff_steers_join) {
+    // The incoming pair alone is balanced either way (1200 vs 800 on some
+    // side); a live match already favoring tf1 by 500 pulls the stronger
+    // newcomer to tf2.
+    std::vector<Player> ps = {
+        {"strong", 680, 1200.0, true}, {"weak", 680, 800.0, true},
+    };
+    std::unordered_map<std::string, int> asn = {{"strong", 1}, {"weak", 2}};
+    MmrSwap::BalanceByMmr(ps, asn, /*seed_diff=*/500.0);
+    CHECK(asn.at("strong") == 2);   // |500 - 400| beats |500 + 400|
+    CHECK(asn.at("weak") == 1);
+}
+
+TEST(mmr_swap_optimal_reaches_global_minimum) {
+    // Greedy stalls at +/-200 on this fixture; optimal reaches ~0.
+    std::vector<Player> ps = {
+        {"m0", 567, 1200.0, true}, {"m1", 567, 1100.0, true},
+        {"m2", 567, 1000.0, true}, {"m3", 567, 900.0, true},
+        {"a0", 680, 1300.0, true}, {"a1", 680, 700.0, true},
+        {"a2", 680, 1000.0, true}, {"a3", 680, 1000.0, true},
+    };
+    std::unordered_map<std::string, int> asn;
+    for (const auto& p : ps) asn[p.guid] = (p.guid[1] < '2') ? 1 : 2;
+
+    MmrSwap::BalanceByMmrOptimal(ps, asn);
+    double s1 = 0.0, s2 = 0.0;
+    int n1 = 0, n2 = 0;
+    for (const auto& p : ps) {
+        if (asn.at(p.guid) == 1) { s1 += p.mmr; ++n1; }
+        else                     { s2 += p.mmr; ++n2; }
+    }
+    const double mean_diff = std::fabs(s1 / n1 - s2 / n2);
+    CHECK(mean_diff < 1e-6);
+}
+
+TEST(mmr_swap_optimal_respects_party_lock) {
+    std::vector<Player> ps = {
+        {"p1", 680, 1500.0, false},
+        {"p2", 680,  500.0, false},
+        {"s1", 680, 1400.0, true},
+        {"s2", 680,  600.0, true},
+    };
+    std::unordered_map<std::string, int> asn =
+        {{"p1", 1}, {"s1", 1}, {"p2", 2}, {"s2", 2}};
+    MmrSwap::BalanceByMmrOptimal(ps, asn);
+    CHECK(asn.at("p1") == 1);
+    CHECK(asn.at("p2") == 2);
+    CHECK(asn.at("s1") == 2);
+    CHECK(asn.at("s2") == 1);
+}
+
+}  // namespace
