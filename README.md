@@ -103,6 +103,21 @@ To cancel a forced mission:
 
 ---
 
+## Troubleshooting
+
+**Home map fails to load / stuck on loading screen**
+
+The server uses ports 9000, 9001, 9010, and 9002–9020. If another application is using one of these ports the server may not function correctly. 
+
+To check for conflicts (cmd or powershell):
+```
+netstat -ano | findstr ":90"
+```
+
+If you find a conflict, you can change the affected port in `out\control-server.json`. For example, change `"ipc_port": 9010` to `"ipc_port": 9030`.
+
+---
+
 ## Screenshots
 
 ![In-game](screenshots/ingame1.png)
