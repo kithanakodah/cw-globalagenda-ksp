@@ -1,8 +1,8 @@
 # CW Global Agenda KSP
 
-A single player offline/local server for [Global Agenda](https://store.steampowered.com/app/17020/Global_Agenda_Free_Agent/), built on top of [commonwealth-ga-server](https://github.com/commonwealthga/commonwealth-ga-server). 
+A single player offline/local server for [Global Agenda](https://store.steampowered.com/app/17020/Global_Agenda_Free_Agent/), built on top of [commonwealth-ga-server](https://github.com/commonwealthga/commonwealth-ga-server).
 
-Play over 20 different PvE missions, with completion tracking, custom difficulty tiers, boss room access gates, enemy tuning, and a launcher to manage everything.  This is a max level 50 build, for playing missions.  
+Play over 20 unique PvE missions, at 4 different in-game difficulties (Medium, High, Max, UMax), with all 4 original classes.  With completion tracking, custom difficulty tiers for every skill level, boss room access gates, enemy tuning, and a launcher to manage everything.  This is a max level 50 build, for playing missions.  
 
 ![Launcher](screenshots/launcher1.png)
 ![Launcher](screenshots/launcher2.png)
@@ -24,8 +24,8 @@ If you do not have Global Agenda installed:
 
 1. Install it via the Steam link above
 2. Let the game install all its requirements
-3. Launch the game once, it will reach a login screen
-4. You can exit at that point — the game is ready
+3. Launch the game once, it will reach a login screen. 
+4. You can exit at that point.  The game is ready to be started from the KSP Launcher.
 
 **Compatible game versions:**
 - Base Global Agenda (fresh install from Steam)
@@ -46,7 +46,7 @@ All three work with KSP. If you want the DLC maps (Central Industrial Complex an
    C:\Program Files (x86)\Steam\steamapps\common\Global Agenda Live\Binaries\GlobalAgenda.exe
    ```
    or similar depending on your game version
-5. Click **Link Server to Game**
+5. Click **Link Server to Game** (this copies some files from the game folder to the server folder for it to run.  Game folder is unaffected)
 6. Select a difficulty tier, see further below or in launcher for descriptions
 7. Click **Start Local Server**
 8. Click **Launch Game**
@@ -75,17 +75,17 @@ Do not start playing on Veteran or higher if this is your first time.  Be sure t
 | Insane | 3.0x | UMax may be doable by the most skilled players |
 | Impossible | 4.0x | Med/High likely doable — Max/UMax may be impossible |
 
-Changing the tier stops the server. Click **Start Local Server** again to apply.
+Changing the tier stops the server. Click **Start Local Server** again to apply change and start server.
 
 ---
 
 ## Queueing Missions
 
-Queue from inside the game: **MISSIONS (M) → TEAM → select difficulty (Medium, High, Max, and UMax are tuned and tracked for completion)**
+Queue from inside the game: **MISSIONS (M) → SPECIAL OPS → TEAM → select difficulty (Medium, High, Max, or UMax) → Commonwealth or Sonoran**
 
-This will queue a random mission from the choice pool.
+This will queue a **RANDOM** mission from the choice pool: Commonwealth or Sonoran.
 
-To queue a specific mission instead of a random one, type one of the following in chat:
+To queue a **SPECIFIC** mission instead of a random one, type one of the following in chat: (Commonwealth is 1-15, Sonoran is 16-24, Refer to the Completions tab for mission numbers)
 
 ```
 -mission max 20
@@ -93,21 +93,29 @@ To queue a specific mission instead of a random one, type one of the following i
 -mi 20 max
 ```
 
-Order of map number and difficulty does not matter. Refer to the Completions tab for mission numbers.
+Order of map number and difficulty does not matter. 
 
-To cancel a forced mission:
+**You then must queue the mission yourself in the mission menu, but you are now guaranteed that mission**
+
+
+To cancel a forced mission (as the queue will block you otherwise):
 ```
 -mission cancel
 -mi cancel
 ```
 
+Medium: moderate density of low-level enemies, few elites
+High: higher density of low-level enemies, some elites 
+Max: some low-level enemies, moderate density of mid and high level elites
+UMax: some low-level enemies, high density of mid and high level elites
+
 ---
 
 ## Troubleshooting
 
-**Home map fails to load / stuck on loading screen**
+**Home map fails to load / stuck on loading screen / chat commands are not working**
 
-The server uses ports 9000, 9001, 9010, and 9002–9020. If another application is using one of these ports the server may not function correctly. 
+The server uses fixed ports 9000 (TCP), 9001 (chat), and 9010 (IPC), and 9002-9020 (dynamic, game instance). If another application is using one of these ports the server may not function correctly. 
 
 To check for conflicts (cmd or powershell):
 ```
@@ -115,6 +123,16 @@ netstat -ano | findstr ":90"
 ```
 
 If you find a conflict, you can change the affected port in `out\control-server.json`. For example, change `"ipc_port": 9010` to `"ipc_port": 9030`.
+
+
+**Getting disconnected after ~5 minutes in mission**
+
+You likely have two KSP Launchers running, and they are conflicting.  Make sure you only have one running, Stop Server, and start server again.  
+
+
+**I'm missing the .bat files and .ps1 files when extracting the zip, like Launcher-GlobalAgendaKSP.bat**
+
+The .bat files and .ps1 file are being blocked by Windows.  Right click the zip file > General tab > Security: This file came...Unblock 
 
 ---
 
