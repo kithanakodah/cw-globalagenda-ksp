@@ -7,6 +7,8 @@ Play over 20 unique PvE missions, at 4 different in-game difficulties (Medium, H
 ![Launcher](screenshots/launcher1.png)
 ![Launcher](screenshots/launcher2.png)
 
+https://youtu.be/TldkxBg9yWo
+
 ---
 
 ## Requirements
@@ -140,7 +142,7 @@ The .bat files and .ps1 file are being blocked by Windows.  Right click the zip 
 
 ---
 
-## Screenshots
+## Screenshots and YouTube
 
 ![In-game](screenshots/ingame1.png)
 
