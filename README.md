@@ -146,6 +146,8 @@ The .bat files and .ps1 file are being blocked by Windows.  Right click the zip 
 
 ![In-game](screenshots/ingame1.png)
 
+https://youtu.be/TldkxBg9yWo
+
 ---
 
 ## Building from Source
