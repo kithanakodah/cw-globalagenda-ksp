@@ -4,10 +4,10 @@ A single player offline/local server for [Global Agenda](https://store.steampowe
 
 Play over 20 unique PvE missions, at 4 different in-game difficulties (Medium, High, Max, UMax), with all 4 original classes.  With completion tracking, custom difficulty tiers for every skill level, boss room access gates, enemy tuning, and a launcher to manage everything.  This is a max level 50 build, for playing missions.  
 
+https://youtu.be/TldkxBg9yWo
+
 ![Launcher](screenshots/launcher1.png)
 ![Launcher](screenshots/launcher2.png)
-
-https://youtu.be/TldkxBg9yWo
 
 ---
 
