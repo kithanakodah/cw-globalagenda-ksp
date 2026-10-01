@@ -85,12 +85,13 @@ Queue from inside the game: **MISSIONS (M) → SPECIAL OPS → TEAM → select d
 
 This will queue a **RANDOM** mission from the choice pool: Commonwealth or Sonoran.
 
-To queue a **SPECIFIC** mission instead of a random one, type one of the following in chat: (Commonwealth is 1-15, Sonoran is 16-24, Refer to the Completions tab for mission numbers)
+To queue a **SPECIFIC** mission instead of a random one, type one of the following in chat (mission difficulty and mission number): (Commonwealth is 1-15, Sonoran is 16-24, Refer to the Completions tab for mission numbers)
 
 ```
--mission max 20
+-mission med 20
+-mission 20 high
 -mi max 20
--mi 20 max
+-mi 20 umax
 ```
 
 Order of map number and difficulty does not matter. 
@@ -105,8 +106,11 @@ To cancel a forced mission (as the queue will block you otherwise):
 ```
 
 Medium: moderate density of low-level enemies, few elites
+
 High: higher density of low-level enemies, some elites 
+
 Max: some low-level enemies, moderate density of mid and high level elites
+
 UMax: some low-level enemies, high density of mid and high level elites
 
 ---
