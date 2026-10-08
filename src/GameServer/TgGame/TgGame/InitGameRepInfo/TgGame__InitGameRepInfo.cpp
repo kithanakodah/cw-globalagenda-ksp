@@ -124,14 +124,14 @@ void __fastcall TgGame__InitGameRepInfo::Call(ATgGame* Game, void* edx) {
 		// r_nReleaseDelay is the corpse delay before joining the wave queue
 		// (UC default 5). Future instant-respawn knob: set all three to 1 here.
 
-		if (Game->m_nSecsToAutoRelease > 15) {
-			Game->m_nSecsToAutoRelease = 15;
-			Game->m_nSecsToAutoReleaseAttackers = Game->m_nSecsToAutoRelease;
-			Game->m_nSecsToAutoReleaseDefenders = Game->m_nSecsToAutoRelease;
-		}
+		// KSP: fixed respawn wave interval (seconds)
+		constexpr int kKspWaveSecs = 3;
+		Game->m_nSecsToAutoRelease          = kKspWaveSecs;
+		Game->m_nSecsToAutoReleaseAttackers = kKspWaveSecs;
+		Game->m_nSecsToAutoReleaseDefenders = kKspWaveSecs;
 		gamerep->r_nSecsToAutoReleaseAttackers = Game->m_nSecsToAutoReleaseAttackers;
 		gamerep->r_nSecsToAutoReleaseDefenders = Game->m_nSecsToAutoReleaseDefenders;
-		gamerep->r_nReleaseDelay = 5;
+		gamerep->r_nReleaseDelay = 7;  // KSP: corpse delay (seconds)
 		gamerep->r_nPointsToWin = 3;
 		gamerep->r_nRoundNumber = 1;
 		gamerep->r_nMaxRoundNumber = 5;

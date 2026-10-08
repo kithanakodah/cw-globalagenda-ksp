@@ -317,6 +317,12 @@ void __fastcall TgPawn_Character__ReapplyCharacterSkillTree::Call(ATgPawn_Charac
 	}
         sqlite3_finalize(stmt);
 
+        Logger::Log("skills",
+                "[Reapply] charId=%lld skills=%d appliedGroups=%d touchedProps=%d\n",
+		(long long)info->selected_character_id, (int)info->skills.size(),
+		appliedGroups, (int)touchedPropIds.size());
+	} while (false);
+	// KSP: regen moved out of the skill scope so it applies even with no skills allocated
         // Personal buff: Lasting Regeneration (+20 HP/sec, 900s lifetime) applied
         // unconditionally at every reapply point (spawn / death-revive / profile
         // switch), since this function is the one guaranteed to run in all three
@@ -356,11 +362,6 @@ void __fastcall TgPawn_Character__ReapplyCharacterSkillTree::Call(ATgPawn_Charac
                 }
         }
         }  // end player-only guard
-        Logger::Log("skills",
-                "[Reapply] charId=%lld skills=%d appliedGroups=%d touchedProps=%d\n",
-		(long long)info->selected_character_id, (int)info->skills.size(),
-		appliedGroups, (int)touchedPropIds.size());
-	} while (false);
 	// (end of do-while skill-apply scope. Breaks above land here so the
 	// combined fanout below always runs, even on the armor-only paths.)
 
